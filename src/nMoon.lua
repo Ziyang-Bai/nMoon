@@ -1,0 +1,3926 @@
+platform.apiLevel = "2.7"
+
+local APP_NAME = "nMoon"
+local APP_VERSION = "Alpha"
+local CHUNK_SIZE = 8000
+local STATUS_HEIGHT = 20
+local STATUS_FONT_SIZE = 7
+local STATUS_BOTTOM_PADDING = 4
+local EDITOR_CONTENT_TOP_INSET = 5
+local EDITOR_TEXT_INSET = 3
+local EDITOR_TEXT_CLIP_INSET = 2
+local EDITOR_TEXT_RIGHT_INSET = 5
+local EDITOR_TEXT_BASELINE_OFFSET = 0
+local EDITOR_CARET_TOP_INSET = 3
+local EDITOR_CARET_BOTTOM_INSET = 1
+local MAX_CONSOLE_LINES = 200
+local INPUT_POLL_SECONDS = 0.04
+local INPUT_SHADOW_LINE = string.rep("x", 32)
+local INPUT_SHADOW = INPUT_SHADOW_LINE .. "\n" .. INPUT_SHADOW_LINE .. "\n" .. INPUT_SHADOW_LINE
+local INPUT_SHADOW_CURSOR = 50
+local INPUT_SHADOW_STRIDE = 33
+
+local function decodeCodepoint(text, position)
+    local first = string.byte(text, position)
+    if not first then return nil, position end
+    if first < 0x80 then return first, position + 1 end
+    local count
+    if first >= 0xF0 and first < 0xF8 then count = 4
+    elseif first >= 0xE0 then count = 3
+    elseif first >= 0xC0 then count = 2
+    else return first, position + 1 end
+    local value = first % (2 ^ (8 - count - 1))
+    for index = 2, count do
+        local byte = string.byte(text, position + index - 1)
+        if not byte or byte < 0x80 or byte >= 0xC0 then
+            return first, position + 1
+        end
+        value = value * 64 + byte - 0x80
+    end
+    return value, position + count
+end
+
+local function isGraphemeExtender(codepoint)
+    return (codepoint >= 0x0300 and codepoint <= 0x036F) or
+        (codepoint >= 0x1AB0 and codepoint <= 0x1AFF) or
+        (codepoint >= 0x1DC0 and codepoint <= 0x1DFF) or
+        (codepoint >= 0x20D0 and codepoint <= 0x20FF) or
+        (codepoint >= 0xFE20 and codepoint <= 0xFE2F) or
+        (codepoint >= 0xFE00 and codepoint <= 0xFE0F) or
+        (codepoint >= 0xE0100 and codepoint <= 0xE01EF) or
+        (codepoint >= 0x1F3FB and codepoint <= 0x1F3FF)
+end
+
+local function unicodeLength(text)
+    local count, position, joinNext = 0, 1, false
+    while position <= #text do
+        local codepoint, nextPosition = decodeCodepoint(text, position)
+        local joined = joinNext or codepoint == 0x200D or
+            isGraphemeExtender(codepoint)
+        if count == 0 or not joined then count = count + 1 end
+        if codepoint == 0x200D then
+            joinNext = true
+        elseif joinNext then
+            joinNext = false
+        end
+        position = nextPosition
+    end
+    return count
+end
+
+local function charToByte(text, column)
+    if column <= 0 then return 1 end
+    local count, position, joinNext = 0, 1, false
+    while position <= #text do
+        local codepoint, nextPosition = decodeCodepoint(text, position)
+        local joined = joinNext or codepoint == 0x200D or
+            isGraphemeExtender(codepoint)
+        if count == 0 or not joined then
+            count = count + 1
+            if count > column then return position end
+        end
+        if codepoint == 0x200D then
+            joinNext = true
+        elseif joinNext then
+            joinNext = false
+        end
+        position = nextPosition
+    end
+    return #text + 1
+end
+
+local function byteToChar(text, bytePosition)
+    local count, position, joinNext = 0, 1, false
+    local limit = math.max(0, math.min(#text, bytePosition - 1))
+    while position <= limit do
+        local codepoint, nextPosition = decodeCodepoint(text, position)
+        local joined = joinNext or codepoint == 0x200D or
+            isGraphemeExtender(codepoint)
+        if count == 0 or not joined then count = count + 1 end
+        if codepoint == 0x200D then
+            joinNext = true
+        elseif joinNext then
+            joinNext = false
+        end
+        position = nextPosition
+    end
+    return count
+end
+
+local function unicodeSub(text, first, last)
+    local length = unicodeLength(text)
+    first = first or 1
+    if first < 0 then first = length + first + 1 end
+    last = last or length
+    if last < 0 then last = length + last + 1 end
+    first = math.max(1, first)
+    last = math.min(length, last)
+    if first > last then return "" end
+    return string.sub(text, charToByte(text, first - 1), charToByte(text, last) - 1)
+end
+
+local function splitLines(text)
+    local normalized = (text or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+    local lines = {}
+    for line in (normalized .. "\n"):gmatch("(.-)\n") do
+        lines[#lines + 1] = line
+    end
+    if #lines == 0 then
+        lines[1] = ""
+    end
+    return lines
+end
+
+local function clamp(value, low, high)
+    if value < low then return low end
+    if value > high then return high end
+    return value
+end
+
+local function comparePosition(rowA, colA, rowB, colB)
+    if rowA < rowB or (rowA == rowB and colA < colB) then
+        return -1
+    end
+    if rowA == rowB and colA == colB then
+        return 0
+    end
+    return 1
+end
+
+local lexicalCodeBefore
+
+local Buffer = {}
+Buffer.__index = Buffer
+
+local function copyPoint(point)
+    if not point then return nil end
+    return { row = point.row, col = point.col }
+end
+
+function Buffer.new(text, changed)
+    local self = setmetatable({}, Buffer)
+    self.lines = splitLines(text)
+    self.row = 1
+    self.col = 0
+    self.goalCol = nil
+    self.anchor = nil
+    self.changed = changed or function() end
+    self.resetVersion = 0
+    return self
+end
+
+function Buffer:lineCount()
+    return #self.lines
+end
+
+function Buffer:line(row)
+    return self.lines[row or self.row]
+end
+
+function Buffer:text()
+    return table.concat(self.lines, "\n")
+end
+
+function Buffer:setText(text)
+    self.lines = splitLines(text)
+    self.row = 1
+    self.col = 0
+    self.goalCol = nil
+    self.anchor = nil
+    self.resetVersion = self.resetVersion + 1
+end
+
+function Buffer:state()
+    return { row = self.row, col = self.col, anchor = copyPoint(self.anchor) }
+end
+
+function Buffer:setState(state)
+    self.row = state.row
+    self.col = state.col
+    self.anchor = copyPoint(state.anchor)
+    self.goalCol = nil
+    self:clampCaret()
+end
+
+function Buffer:clampCaret()
+    self.row = clamp(self.row, 1, #self.lines)
+    self.col = clamp(self.col, 0, unicodeLength(self.lines[self.row]))
+    if self.anchor then
+        self.anchor.row = clamp(self.anchor.row, 1, #self.lines)
+        self.anchor.col = clamp(self.anchor.col, 0,
+            unicodeLength(self.lines[self.anchor.row]))
+    end
+end
+
+function Buffer:setCaret(row, col, extend)
+    if extend and not self.anchor then
+        self.anchor = { row = self.row, col = self.col }
+    elseif not extend then
+        self.anchor = nil
+    end
+    self.row = row
+    self.col = col
+    self:clampCaret()
+    self.goalCol = nil
+end
+
+function Buffer:hasSelection()
+    return self.anchor ~= nil and
+        comparePosition(self.anchor.row, self.anchor.col, self.row, self.col) ~= 0
+end
+
+function Buffer:selectionBounds()
+    if not self:hasSelection() then return nil end
+    local anchor = self.anchor
+    if comparePosition(anchor.row, anchor.col, self.row, self.col) <= 0 then
+        return anchor.row, anchor.col, self.row, self.col
+    end
+    return self.row, self.col, anchor.row, anchor.col
+end
+
+function Buffer:clearSelection()
+    self.anchor = nil
+end
+
+function Buffer:toggleSelection()
+    if self.anchor then
+        self.anchor = nil
+    else
+        self.anchor = { row = self.row, col = self.col }
+    end
+end
+
+function Buffer:selectAll()
+    self.anchor = { row = 1, col = 0 }
+    self.row = #self.lines
+    self.col = unicodeLength(self.lines[self.row])
+    self.goalCol = nil
+end
+
+function Buffer:textRange(firstRow, firstCol, lastRow, lastCol)
+    if firstRow == lastRow then
+        return unicodeSub(self.lines[firstRow], firstCol + 1, lastCol)
+    end
+    local pieces = { unicodeSub(self.lines[firstRow], firstCol + 1) }
+    for row = firstRow + 1, lastRow - 1 do
+        pieces[#pieces + 1] = self.lines[row]
+    end
+    pieces[#pieces + 1] = unicodeSub(self.lines[lastRow], 1, lastCol)
+    return table.concat(pieces, "\n")
+end
+
+function Buffer:selectedText()
+    local firstRow, firstCol, lastRow, lastCol = self:selectionBounds()
+    if not firstRow then return nil end
+    return self:textRange(firstRow, firstCol, lastRow, lastCol)
+end
+
+function Buffer:positionAfter(row, col, text)
+    local incoming = splitLines(text)
+    if #incoming == 1 then
+        return row, col + unicodeLength(incoming[1])
+    end
+    return row + #incoming - 1, unicodeLength(incoming[#incoming])
+end
+
+function Buffer:replaceRange(firstRow, firstCol, lastRow, lastCol, text, kind, before, notify)
+    text = text or ""
+    before = before or self:state()
+    local removed = self:textRange(firstRow, firstCol, lastRow, lastCol)
+    local left = unicodeSub(self.lines[firstRow], 1, firstCol)
+    local right = unicodeSub(self.lines[lastRow], lastCol + 1)
+    local incoming = splitLines(text)
+    self.lines[firstRow] = left .. incoming[1]
+    for _ = firstRow + 1, lastRow do table.remove(self.lines, firstRow + 1) end
+    for index = 2, #incoming - 1 do
+        table.insert(self.lines, firstRow + index - 1, incoming[index])
+    end
+    if #incoming == 1 then
+        self.lines[firstRow] = self.lines[firstRow] .. right
+    else
+        table.insert(self.lines, firstRow + #incoming - 1, incoming[#incoming] .. right)
+    end
+    local newRow, newCol = self:positionAfter(firstRow, firstCol, text)
+    self.row, self.col = newRow, newCol
+    self.anchor = nil
+    self.goalCol = nil
+    local edit = {
+        kind = kind or "replace",
+        startRow = firstRow, startCol = firstCol,
+        oldEndRow = lastRow, oldEndCol = lastCol,
+        newEndRow = newRow, newEndCol = newCol,
+        removed = removed, inserted = text,
+        before = before, after = self:state()
+    }
+    if notify ~= false then self.changed(edit) end
+    return edit
+end
+
+function Buffer:applyEdit(edit, reverse)
+    if reverse then
+        self:replaceRange(edit.startRow, edit.startCol, edit.newEndRow, edit.newEndCol,
+            edit.removed, "history", nil, false)
+        self:setState(edit.before)
+    else
+        self:replaceRange(edit.startRow, edit.startCol, edit.oldEndRow, edit.oldEndCol,
+            edit.inserted, "history", nil, false)
+        self:setState(edit.after)
+    end
+end
+
+function Buffer:deleteSelection(notify, kind)
+    local firstRow, firstCol, lastRow, lastCol = self:selectionBounds()
+    if not firstRow then return false end
+    self:replaceRange(firstRow, firstCol, lastRow, lastCol, "",
+        kind or "deleteSelection", nil, notify)
+    return true
+end
+
+function Buffer:insert(text, kind)
+    if text == nil or text == "" then return end
+    local firstRow, firstCol, lastRow, lastCol = self:selectionBounds()
+    if not firstRow then
+        firstRow, firstCol, lastRow, lastCol =
+            self.row, self.col, self.row, self.col
+    end
+    self:replaceRange(firstRow, firstCol, lastRow, lastCol, text,
+        kind or (firstRow == lastRow and firstCol == lastCol and "insert" or "replace"))
+end
+
+function Buffer:backspace()
+    if self:deleteSelection(true, "backspace") then return end
+    if self.col > 0 then
+        self:replaceRange(self.row, self.col - 1, self.row, self.col, "", "backspace")
+    elseif self.row > 1 then
+        local previousLength = unicodeLength(self.lines[self.row - 1])
+        self:replaceRange(self.row - 1, previousLength, self.row, 0, "", "backspace")
+    end
+end
+
+function Buffer:backspaceSmart()
+    if self:hasSelection() then
+        self:deleteSelection(true, "backspace")
+        return
+    end
+    if self.col > 0 then
+        local line = self.lines[self.row]
+        local left = unicodeSub(line, self.col, self.col)
+        local right = unicodeSub(line, self.col + 1, self.col + 1)
+        local pairs = { ["("] = ")", ["["] = "]", ["{"] = "}",
+                        ["\""] = "\"", ["'"] = "'" }
+        if pairs[left] == right then
+            self:replaceRange(self.row, self.col - 1, self.row, self.col + 1,
+                "", "backspace")
+            return
+        end
+    end
+    self:backspace()
+end
+
+function Buffer:deleteForward()
+    if self:deleteSelection(true, "delete") then return end
+    local length = unicodeLength(self.lines[self.row])
+    if self.col < length then
+        self:replaceRange(self.row, self.col, self.row, self.col + 1, "", "delete")
+    elseif self.row < #self.lines then
+        self:replaceRange(self.row, self.col, self.row + 1, 0, "", "delete")
+    end
+end
+
+function Buffer:newline(indentWidth, smart)
+    local firstRow, firstCol, lastRow, lastCol = self:selectionBounds()
+    local hadSelection = firstRow ~= nil
+    if not firstRow then
+        firstRow, firstCol, lastRow, lastCol =
+            self.row, self.col, self.row, self.col
+    end
+    local line = self.lines[firstRow]
+    local left = unicodeSub(line, 1, firstCol)
+    local right = unicodeSub(self.lines[lastRow], lastCol + 1)
+    local indent = left:match("^(%s*)") or ""
+    local extra = ""
+    local code = self.codeBefore and self.codeBefore(firstRow, left) or
+        (lexicalCodeBefore and lexicalCodeBefore(self.lines, firstRow, left) or left)
+    local trimmed = code:gsub("%s+$", "")
+    if smart and not hadSelection then
+        if trimmed:match("%f[%a]function%f[%A].*$") or
+            trimmed:match("%f[%a]then%s*$") or
+            trimmed:match("%f[%a]do%s*$") or
+            trimmed:match("^%s*repeat%s*$") or
+            trimmed:match("^%s*else%s*$") or
+            trimmed:match("{%s*$") then
+            extra = string.rep(" ", indentWidth or 4)
+        end
+    end
+    if extra ~= "" and trimmed:match("{%s*$") and
+        right:match("^%s*}") then
+        local edit = self:replaceRange(firstRow, firstCol, lastRow, lastCol,
+            "\n" .. indent .. extra .. "\n" .. indent, "newline", nil, false)
+        self:setCaret(firstRow + 1, unicodeLength(indent .. extra), false)
+        edit.after = self:state()
+        self.changed(edit)
+    else
+        self:replaceRange(firstRow, firstCol, lastRow, lastCol,
+            "\n" .. indent .. extra, "newline")
+    end
+end
+
+function Buffer:deleteLine()
+    if self:deleteSelection(true, "deleteLine") then return end
+    local row = self.row
+    if #self.lines == 1 then
+        if self.lines[1] ~= "" then
+            self:replaceRange(1, 0, 1, unicodeLength(self.lines[1]), "", "deleteLine")
+        end
+    elseif row < #self.lines then
+        self:replaceRange(row, 0, row + 1, 0, "", "deleteLine")
+    else
+        local previous = row - 1
+        local edit = self:replaceRange(previous, unicodeLength(self.lines[previous]),
+            row, unicodeLength(self.lines[row]), "", "deleteLine", nil, false)
+        self:setCaret(previous, 0, false)
+        edit.after = self:state()
+        self.changed(edit)
+    end
+end
+
+function Buffer:moveHorizontal(delta, extend)
+    local row, col = self.row, self.col
+    if delta < 0 then
+        if col > 0 then
+            col = col - 1
+        elseif row > 1 then
+            row = row - 1
+            col = unicodeLength(self.lines[row])
+        end
+    elseif col < unicodeLength(self.lines[row]) then
+        col = col + 1
+    elseif row < #self.lines then
+        row = row + 1
+        col = 0
+    end
+    self:setCaret(row, col, extend)
+end
+
+function Buffer:moveVertical(delta, extend)
+    if not self.goalCol then self.goalCol = self.col end
+    if extend and not self.anchor then
+        self.anchor = { row = self.row, col = self.col }
+    elseif not extend then
+        self.anchor = nil
+    end
+    self.row = clamp(self.row + delta, 1, #self.lines)
+    self.col = math.min(self.goalCol, unicodeLength(self.lines[self.row]))
+end
+
+local function characterClass(character)
+    if character == "" then return "space" end
+    if character:match("^%s$") then return "space" end
+    local byte = string.byte(character)
+    if (byte and byte >= 0x80) or character:match("^[%w_]$") then return "word" end
+    return "punct"
+end
+
+function Buffer:moveWord(delta, extend)
+    local row, col = self.row, self.col
+    if delta < 0 then
+        if col == 0 and row > 1 then
+            row = row - 1
+            col = unicodeLength(self.lines[row])
+        end
+        local line = self.lines[row]
+        while col > 0 and characterClass(unicodeSub(line, col, col)) == "space" do
+            col = col - 1
+        end
+        local class = characterClass(unicodeSub(line, col, col))
+        while col > 0 and characterClass(unicodeSub(line, col, col)) == class do
+            col = col - 1
+        end
+    else
+        local line = self.lines[row]
+        local length = unicodeLength(line)
+        if col == length and row < #self.lines then
+            row, col = row + 1, 0
+            line = self.lines[row]
+            length = unicodeLength(line)
+        end
+        local class = characterClass(unicodeSub(line, col + 1, col + 1))
+        while col < length and
+            characterClass(unicodeSub(line, col + 1, col + 1)) == class do
+            col = col + 1
+        end
+        while col < length and
+            characterClass(unicodeSub(line, col + 1, col + 1)) == "space" do
+            col = col + 1
+        end
+    end
+    self:setCaret(row, col, extend)
+end
+
+function Buffer:deleteWord(delta)
+    if self:hasSelection() then
+        self:deleteSelection(true, delta < 0 and "backspace" or "delete")
+        return
+    end
+    local before = self:state()
+    self:moveWord(delta, true)
+    local firstRow, firstCol, lastRow, lastCol = self:selectionBounds()
+    if firstRow then
+        self:replaceRange(firstRow, firstCol, lastRow, lastCol, "",
+            delta < 0 and "backspace" or "delete", before)
+    end
+end
+
+function Buffer:wrapSelection(opening, closing)
+    local firstRow, firstCol, lastRow, lastCol = self:selectionBounds()
+    if not firstRow then return false end
+    local selected = self:textRange(firstRow, firstCol, lastRow, lastCol)
+    local edit = self:replaceRange(firstRow, firstCol, lastRow, lastCol,
+        opening .. selected .. closing, "pair", nil, false)
+    local innerStartRow, innerStartCol = self:positionAfter(firstRow, firstCol, opening)
+    local innerEndRow, innerEndCol = self:positionAfter(innerStartRow, innerStartCol, selected)
+    self.anchor = { row = innerStartRow, col = innerStartCol }
+    self.row, self.col = innerEndRow, innerEndCol
+    edit.after = self:state()
+    self.changed(edit)
+    return true
+end
+
+function Buffer:insertPair(opening, closing)
+    if self:wrapSelection(opening, closing) then return end
+    local row, col = self.row, self.col
+    local edit = self:replaceRange(row, col, row, col,
+        opening .. closing, "pair", nil, false)
+    self:setCaret(row, col + unicodeLength(opening), false)
+    edit.after = self:state()
+    self.changed(edit)
+end
+
+function Buffer:indent(spaces)
+    local firstRow, _, lastRow = self:selectionBounds()
+    firstRow = firstRow or self.row
+    lastRow = lastRow or self.row
+    local before = self:state()
+    local pieces = {}
+    for row = firstRow, lastRow do pieces[#pieces + 1] = spaces .. self.lines[row] end
+    local edit = self:replaceRange(firstRow, 0, lastRow,
+        unicodeLength(self.lines[lastRow]), table.concat(pieces, "\n"),
+        "indent", before, false)
+    local amount = unicodeLength(spaces)
+    self.row, self.col = before.row, before.col + amount
+    self.anchor = copyPoint(before.anchor)
+    if self.anchor then self.anchor.col = self.anchor.col + amount end
+    edit.after = self:state()
+    self.changed(edit)
+end
+
+function Buffer:outdent(width)
+    local firstRow, _, lastRow = self:selectionBounds()
+    firstRow = firstRow or self.row
+    lastRow = lastRow or self.row
+    local before = self:state()
+    local pieces, removedAtCaret, removedAtAnchor = {}, 0, 0
+    for row = firstRow, lastRow do
+        local whitespace = self.lines[row]:match("^(%s*)") or ""
+        local count = math.min(unicodeLength(whitespace), width)
+        pieces[#pieces + 1] = unicodeSub(self.lines[row], count + 1)
+        if row == before.row then removedAtCaret = count end
+        if before.anchor and row == before.anchor.row then removedAtAnchor = count end
+    end
+    if table.concat(pieces, "\n") == self:textRange(firstRow, 0, lastRow,
+        unicodeLength(self.lines[lastRow])) then return end
+    local edit = self:replaceRange(firstRow, 0, lastRow,
+        unicodeLength(self.lines[lastRow]), table.concat(pieces, "\n"),
+        "outdent", before, false)
+    self.row, self.col = before.row, math.max(0, before.col - removedAtCaret)
+    self.anchor = copyPoint(before.anchor)
+    if self.anchor then
+        self.anchor.col = math.max(0, self.anchor.col - removedAtAnchor)
+    end
+    edit.after = self:state()
+    self.changed(edit)
+end
+
+local Storage = {}
+local RECENT_VARIABLE = "nmoon_recent"
+local RECENT_HEADER = "nMoonRecent1"
+local MAX_RECENT_FILES = 12
+local TRANSACTION_HEADER = "nMoonTxn1"
+local TRANSACTION_SLOTS = 9
+
+local function storeValue(name, value)
+    local called, message = pcall(var.store, name, value)
+    if not called then return false, tostring(message) end
+    if message ~= nil then return false, tostring(message) end
+    return true
+end
+
+local function recallValue(name)
+    local called, value = pcall(var.recall, name)
+    if not called then return false, nil, tostring(value) end
+    return true, value
+end
+
+local function evalAssignment(expression)
+    local called, value, evalError = pcall(math.eval, expression)
+    if not called then return false, tostring(value) end
+    if evalError ~= nil then return false, tostring(evalError) end
+    return true, value
+end
+
+local function transactionFor(index)
+    local prefix = "nmt" .. tostring(index)
+    local transaction = {
+        whole = prefix .. "whole",
+        part = prefix .. "part",
+        backup = prefix .. "backup",
+        owner = prefix .. "owner"
+    }
+    transaction.marker = table.concat({
+        TRANSACTION_HEADER, transaction.whole, transaction.part,
+        transaction.backup
+    }, "\n")
+    return transaction
+end
+
+function Storage.exists(name)
+    if type(var.list) == "function" then
+        local ok, names = pcall(var.list)
+        if ok and type(names) == "table" then
+            for _, listed in ipairs(names) do
+                if listed == name then return true end
+            end
+        end
+    end
+    local ok, value = recallValue(name)
+    if ok and value ~= nil then return true end
+    if type(var.recallStr) == "function" then
+        local recalled, asText = pcall(var.recallStr, name)
+        if recalled and asText ~= nil then return true end
+    end
+    return false
+end
+
+function Storage.validName(name)
+    return type(name) == "string" and #name <= 16 and
+        name:match("^[A-Za-z][A-Za-z0-9_]*$") ~= nil
+end
+function Storage.isUserTextName(name)
+    if not Storage.validName(name) or name == RECENT_VARIABLE then return false end
+    for index = 1, TRANSACTION_SLOTS do
+        local transaction = transactionFor(index)
+        if name == transaction.whole or name == transaction.part or
+            name == transaction.backup or name == transaction.owner then
+            return false
+        end
+    end
+    return true
+end
+
+
+function Storage.load(name)
+    if not Storage.validName(name) then
+        return nil, "文件名格式无效"
+    end
+    local ok, value, message = recallValue(name)
+    if not ok then return nil, message end
+    if type(value) ~= "string" then
+        return nil, "没有找到文本变量：" .. name
+    end
+    return value
+end
+
+function Storage.loadRecent()
+    local ok, value = recallValue(RECENT_VARIABLE)
+    if not ok or type(value) ~= "string" then return {} end
+    local lines = splitLines(value)
+    if lines[1] ~= RECENT_HEADER then return {} end
+    local recent = {}
+    for index = 2, #lines do
+        if Storage.validName(lines[index]) and lines[index] ~= RECENT_VARIABLE then
+            recent[#recent + 1] = lines[index]
+        end
+    end
+    return recent
+end
+
+function Storage.saveRecent(recent)
+    local ok, existing = recallValue(RECENT_VARIABLE)
+    if not ok then return false end
+    if Storage.exists(RECENT_VARIABLE) and
+        (type(existing) ~= "string" or splitLines(existing)[1] ~= RECENT_HEADER) then
+        return false
+    end
+    local lines = { RECENT_HEADER }
+    for index = 1, math.min(#recent, MAX_RECENT_FILES) do
+        lines[#lines + 1] = recent[index]
+    end
+    return storeValue(RECENT_VARIABLE, table.concat(lines, "\n"))
+end
+
+function Storage.listText(recent)
+    local names, seen = {}, {}
+    local function add(name)
+        if not Storage.validName(name) or name == RECENT_VARIABLE or seen[name] then return end
+        local value = Storage.load(name)
+        if value ~= nil then
+            seen[name] = true
+            names[#names + 1] = name
+        end
+    end
+    for _, name in ipairs(recent or {}) do add(name) end
+    if type(var.list) == "function" then
+        local ok, listed = pcall(var.list)
+        if ok and type(listed) == "table" then
+            table.sort(listed)
+            for _, name in ipairs(listed) do add(name) end
+        end
+    end
+    return names
+end
+
+function Storage.cleanup(name)
+    return storeValue(name, nil)
+end
+
+function Storage.cleanupOwned(transaction)
+    local ok, marker = recallValue(transaction.owner)
+    if not ok or marker ~= transaction.marker then return false end
+    storeValue(transaction.whole, nil)
+    storeValue(transaction.part, nil)
+    storeValue(transaction.backup, nil)
+    storeValue(transaction.owner, nil)
+    return true
+end
+
+function Storage.recoverTransactions()
+    for index = 1, TRANSACTION_SLOTS do
+        Storage.cleanupOwned(transactionFor(index))
+    end
+end
+
+function Storage.temporaryNames(destination)
+    for index = 1, TRANSACTION_SLOTS do
+        local transaction = transactionFor(index)
+        if transaction.whole ~= destination and transaction.part ~= destination and
+            transaction.backup ~= destination and transaction.owner ~= destination and
+            not Storage.exists(transaction.whole) and
+            not Storage.exists(transaction.part) and
+            not Storage.exists(transaction.backup) and
+            not Storage.exists(transaction.owner) then
+            return transaction
+        end
+    end
+    return nil
+end
+
+local function chunkEnd(text, position)
+    local last = math.min(#text, position + CHUNK_SIZE - 1)
+    while last < #text do
+        local nextByte = string.byte(text, last + 1)
+        if not nextByte or nextByte < 0x80 or nextByte >= 0xC0 then break end
+        last = last + 1
+    end
+    return last
+end
+
+function Storage.save(name, text)
+    if not Storage.validName(name) then
+        return false, "名称须以英文字母开头，只能含字母、数字、下划线，最长16字符"
+    end
+    if type(text) ~= "string" then return false, "只能保存文本" end
+    local transaction = Storage.temporaryNames(name)
+    if not transaction then return false, "没有可用的临时变量" end
+    local ok, message = storeValue(transaction.owner, transaction.marker)
+    if not ok then return false, message end
+
+    local function fail(reason)
+        Storage.cleanupOwned(transaction)
+        return false, reason
+    end
+
+    ok, message = storeValue(transaction.whole, "")
+    if not ok then return fail(message) end
+    local position = 1
+    while position <= #text do
+        local last = chunkEnd(text, position)
+        ok, message = storeValue(transaction.part, string.sub(text, position, last))
+        if not ok then return fail(message) end
+        ok, message = evalAssignment(transaction.whole .. ":=" ..
+            transaction.whole .. "&" .. transaction.part)
+        if not ok then return fail(message) end
+        position = last + 1
+    end
+
+    local temporaryOk, temporaryText, temporaryError =
+        recallValue(transaction.whole)
+    if not temporaryOk then return fail(temporaryError) end
+    if temporaryText ~= text then
+        return fail("提交前校验失败，未修改原文件")
+    end
+
+    local existed = Storage.exists(name)
+    local oldOk, oldValue, oldError = recallValue(name)
+    if not oldOk then return fail(oldError) end
+    if existed then
+        ok, message = evalAssignment(transaction.backup .. ":=" .. name)
+        if not ok then return fail("无法备份原文件：" .. message) end
+    end
+
+    local function rollback(reason)
+        local rolledBack, rollbackError
+        if existed then
+            rolledBack, rollbackError =
+                evalAssignment(name .. ":=" .. transaction.backup)
+        else
+            rolledBack, rollbackError = storeValue(name, nil)
+        end
+        if rolledBack then
+            local recalled, restored = recallValue(name)
+            if recalled and ((not existed and restored == nil) or
+                (existed and restored == oldValue)) then
+                Storage.cleanupOwned(transaction)
+                return false, reason .. "；已恢复原文件"
+            end
+            rolledBack, rollbackError = false, "回读不一致"
+        end
+        Storage.cleanupOwned(transaction)
+        return false, reason .. "；回滚失败：" .. tostring(rollbackError)
+    end
+
+    ok, message = evalAssignment(name .. ":=" .. transaction.whole)
+    if not ok then return rollback("最终写入失败：" .. message) end
+    local savedOk, saved, savedError = recallValue(name)
+    if not savedOk then return rollback("写入后回读失败：" .. savedError) end
+    if saved ~= text then return rollback("写入后校验失败") end
+    Storage.cleanupOwned(transaction)
+    return true
+end
+
+function Storage.delete(name)
+    if not Storage.validName(name) then
+        return false, "文件名格式无效"
+    end
+    return storeValue(name, nil)
+end
+
+Storage.recoverTransactions()
+
+local themes = {
+    { background = 0xFFFFFF, gutter = 0xF5F7FA, text = 0x1F2937, muted = 0x94A3B8,
+      current = 0xF1F6FF, selection = 0xBFD8FF, cursor = 0x2563EB, status = 0xF8FAFC,
+      statusText = 0x334155, statusMuted = 0x64748B, error = 0xB91C1C,
+      border = 0xD8DEE8, accent = 0x3B82F6, keyword = 0x7C3AED,
+      string = 0x087F5B, number = 0xC2410C, comment = 0x718096, builtin = 0x0369A1 },
+    { background = 0x181A1F, gutter = 0x20232A, text = 0xE5E7EB, muted = 0x7C8594,
+      current = 0x242A35, selection = 0x27496D, cursor = 0x60A5FA, status = 0x20232A,
+      statusText = 0xE5E7EB, statusMuted = 0x9CA3AF, error = 0xF87171,
+      border = 0x343A46, accent = 0x60A5FA, keyword = 0xC084FC,
+      string = 0x6EE7B7, number = 0xFDBA74, comment = 0x87909E, builtin = 0x7DD3FC },
+    { background = 0xFFFCF4, gutter = 0xF7F1E3, text = 0x3F352B, muted = 0x958474,
+      current = 0xF8F1DD, selection = 0xD8E8D1, cursor = 0x2F6F5E, status = 0xF7F1E3,
+      statusText = 0x4B4035, statusMuted = 0x7D6F60, error = 0xB42318,
+      border = 0xE5DCCB, accent = 0x3B7D6B, keyword = 0x7C3F58,
+      string = 0x34705D, number = 0xA35325, comment = 0x8A7968, builtin = 0x28666E }
+}
+
+local luaKeywords = {
+    ["and"] = true, ["break"] = true, ["do"] = true, ["else"] = true,
+    ["elseif"] = true, ["end"] = true, ["false"] = true, ["for"] = true,
+    ["function"] = true, ["if"] = true, ["in"] = true, ["local"] = true,
+    ["nil"] = true, ["not"] = true, ["or"] = true, ["repeat"] = true,
+    ["return"] = true, ["then"] = true, ["true"] = true, ["until"] = true,
+    ["while"] = true
+}
+
+local luaBuiltins = {
+    assert = true, error = true, ipairs = true, next = true, pairs = true,
+    pcall = true, print = true, select = true, tonumber = true, tostring = true,
+    type = true, unpack = true, xpcall = true, math = true, string = true,
+    table = true, coroutine = true, platform = true, clipboard = true,
+    timer = true, var = true, document = true, toolpalette = true
+}
+
+local function identifierStart(byte)
+    return byte == 95 or byte and
+        ((byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122))
+end
+
+local function identifierPart(byte)
+    return identifierStart(byte) or byte and byte >= 48 and byte <= 57
+end
+
+local function longBracketAt(line, position)
+    local equals = string.sub(line, position):match("^%[(=*)%[")
+    if equals == nil then return nil end
+    return equals, #equals + 2
+end
+
+local function scanNumber(line, position)
+    local length = #line
+    local start = position
+    local current = string.byte(line, position)
+    if current == 46 and string.byte(line, position - 1) == 46 then return nil end
+    if current == 48 then
+        local marker = string.byte(line, position + 1)
+        if marker == 88 or marker == 120 then
+            position = position + 2
+            local digits = position
+            while position <= length do
+                local byte = string.byte(line, position)
+                if not ((byte >= 48 and byte <= 57) or
+                    (byte >= 65 and byte <= 70) or
+                    (byte >= 97 and byte <= 102)) then break end
+                position = position + 1
+            end
+            if position == digits or identifierPart(string.byte(line, position)) then
+                return nil
+            end
+            return string.sub(line, start, position - 1)
+        end
+    end
+
+    local digitsBefore = 0
+    while position <= length do
+        local byte = string.byte(line, position)
+        if not byte or byte < 48 or byte > 57 then break end
+        digitsBefore = digitsBefore + 1
+        position = position + 1
+    end
+    local digitsAfter = 0
+    if string.byte(line, position) == 46 and
+        string.byte(line, position + 1) ~= 46 then
+        position = position + 1
+        while position <= length do
+            local byte = string.byte(line, position)
+            if not byte or byte < 48 or byte > 57 then break end
+            digitsAfter = digitsAfter + 1
+            position = position + 1
+        end
+    end
+    if digitsBefore == 0 and digitsAfter == 0 then return nil end
+
+    local exponent = string.byte(line, position)
+    if exponent == 69 or exponent == 101 then
+        local exponentStart = position
+        position = position + 1
+        local sign = string.byte(line, position)
+        if sign == 43 or sign == 45 then position = position + 1 end
+        local exponentDigits = position
+        while position <= length do
+            local byte = string.byte(line, position)
+            if not byte or byte < 48 or byte > 57 then break end
+            position = position + 1
+        end
+        if position == exponentDigits then position = exponentStart end
+    end
+    if identifierPart(string.byte(line, position)) then return nil end
+    return string.sub(line, start, position - 1)
+end
+
+local function syntaxSegments(line, inputState)
+    local segments, state = {}, inputState
+    local position, length = 1, #line
+    local function add(text, kind)
+        if text == "" then return end
+        local previous = segments[#segments]
+        if previous and previous.kind == kind then
+            previous.text = previous.text .. text
+        else
+            segments[#segments + 1] = { text = text, kind = kind }
+        end
+    end
+    while position <= length do
+        if state then
+            local closingText = "]" .. state.equals .. "]"
+            local closing = string.find(line, closingText, position, true)
+            if not closing then
+                add(string.sub(line, position), state.kind)
+                return segments, state
+            end
+            local last = closing + #closingText - 1
+            add(string.sub(line, position, last), state.kind)
+            position, state = last + 1, nil
+        else
+            local byte = string.byte(line, position)
+            local pair = string.sub(line, position, position + 1)
+            if pair == "--" then
+                local equals, openerLength = longBracketAt(line, position + 2)
+                if not equals then
+                    add(string.sub(line, position), "comment")
+                    break
+                end
+                local closingText = "]" .. equals .. "]"
+                local closing = string.find(line, closingText,
+                    position + 2 + openerLength, true)
+                if closing then
+                    local last = closing + #closingText - 1
+                    add(string.sub(line, position, last), "comment")
+                    position = last + 1
+                else
+                    add(string.sub(line, position), "comment")
+                    state = { kind = "comment", equals = equals }
+                    break
+                end
+            elseif byte == 34 or byte == 39 then
+                local quote, last = byte, position + 1
+                while last <= length do
+                    local current = string.byte(line, last)
+                    if current == 92 then
+                        last = last + 2
+                    else
+                        last = last + 1
+                        if current == quote then break end
+                    end
+                end
+                add(string.sub(line, position, math.min(last - 1, length)), "string")
+                position = last
+            else
+                local equals, openerLength = longBracketAt(line, position)
+                if equals then
+                    local closingText = "]" .. equals .. "]"
+                    local closing = string.find(line, closingText,
+                        position + openerLength, true)
+                    if closing then
+                        local last = closing + #closingText - 1
+                        add(string.sub(line, position, last), "string")
+                        position = last + 1
+                    else
+                        add(string.sub(line, position), "string")
+                        state = { kind = "string", equals = equals }
+                        break
+                    end
+                else
+                    local number
+                    if byte and ((byte >= 48 and byte <= 57) or
+                        (byte == 46 and (string.byte(line, position + 1) or 0) >= 48 and
+                            (string.byte(line, position + 1) or 0) <= 57)) then
+                        number = scanNumber(line, position)
+                    end
+                    if number then
+                        add(number, "number")
+                        position = position + #number
+                    elseif identifierStart(byte) then
+                        local last = position + 1
+                        while identifierPart(string.byte(line, last)) do last = last + 1 end
+                        local word = string.sub(line, position, last - 1)
+                        add(word, luaKeywords[word] and "keyword" or
+                            (luaBuiltins[word] and "builtin" or "text"))
+                        position = last
+                    else
+                        add(string.sub(line, position, position), "text")
+                        position = position + 1
+                    end
+                end
+            end
+        end
+    end
+    return segments, state
+end
+
+lexicalCodeBefore = function(lines, row, prefix, inputState, stateKnown)
+    local state = inputState
+    if not stateKnown then
+        for index = 1, row - 1 do
+            local _, outputState = syntaxSegments(lines[index], state)
+            state = outputState
+        end
+    end
+    local segments = syntaxSegments(prefix, state)
+    local code = {}
+    for _, segment in ipairs(segments) do
+        if segment.kind == "comment" or segment.kind == "string" then
+            code[#code + 1] = string.rep(" ", #segment.text)
+        else
+            code[#code + 1] = segment.text
+        end
+    end
+    return table.concat(code)
+end
+
+local snippets = {
+    ["函数"] = "function name()\n    \nend",
+    ["条件"] = "if condition then\n    \nend",
+    ["循环"] = "for index = 1, 10 do\n    \nend",
+    ["事件"] = "function on.paint(gc)\n    \nend"
+}
+
+local HELP_TITLE = "nMoon Alpha — TI-Nspire Lua 中文编辑器"
+local HELP_HORIZONTAL_PADDING = 8
+local HELP_TITLE_GAP = 3
+local HELP_BREAK_AFTER = {
+    [","] = true, ["."] = true, ["!"] = true, ["?"] = true,
+    [":"] = true, [";"] = true, ["/"] = true, ["-"] = true,
+    [")"] = true, ["]"] = true, ["}"] = true,
+    ["，"] = true, ["。"] = true, ["！"] = true, ["？"] = true,
+    ["："] = true, ["；"] = true, ["、"] = true, ["）"] = true,
+    ["】"] = true, ["》"] = true, ["」"] = true, ["』"] = true,
+    ["—"] = true, ["·"] = true
+}
+
+local helpLines = {
+    "按键：方向键移动，Shift+方向键选择",
+    "按键：Home/End移至行首/行尾，PageUp/PageDown翻页",
+    "按键：Tab/Shift+Tab增加/减少缩进",
+    "按键：Enter智能缩进并自动配对括号和引号",
+    "按键：Esc取消提示、关闭列表或返回编辑器",
+    "",
+    "组合键：Ctrl+A/C/X/V全选、复制、剪切、粘贴",
+    "组合键：Ctrl+Z/Y撤销、重做",
+    "组合键：Ctrl+S/F保存、查找",
+    "组合键：Ctrl+N/O/R新建、打开、运行",
+    "",
+    "功能：文件列表 / 最近可浏览并打开 TI-Nspire 文本变量",
+    "功能：查找支持上/下一处和循环查找",
+    "功能：运行代码后显示预览，Tab切换图形/控制台",
+    "功能：运行输出支持滚动、复制、清空",
+    "功能：未保存修改和覆盖已有变量时提供确认",
+    "",
+    "警告：请勿使用中文文件名",
+    "警告：请使用英文字母开头、最长16字符的文件名"
+}
+
+local function measuredPrefixLength(gc, text, maximumWidth)
+    local low, high = 0, unicodeLength(text)
+    while low < high do
+        local middle = math.floor((low + high + 1) / 2)
+        if gc:getStringWidth(unicodeSub(text, 1, middle)) <= maximumWidth then
+            low = middle
+        else
+            high = middle - 1
+        end
+    end
+    return low
+end
+
+local function wrapMeasuredText(gc, text, maximumWidth)
+    if text == "" then return { "" } end
+    local wrapped = {}
+    local remaining = tostring(text or "")
+    while remaining ~= "" do
+        if gc:getStringWidth(remaining) <= maximumWidth then
+            wrapped[#wrapped + 1] = remaining
+            break
+        end
+        local fitting = measuredPrefixLength(gc, remaining, maximumWidth)
+        if fitting < 1 then fitting = 1 end
+        local segmentEnd, nextStart = fitting, fitting + 1
+        for index = 1, fitting do
+            local character = unicodeSub(remaining, index, index)
+            if character:match("^%s$") then
+                if index > 1 then
+                    segmentEnd, nextStart = index - 1, index + 1
+                end
+            elseif HELP_BREAK_AFTER[character] then
+                segmentEnd, nextStart = index, index + 1
+            end
+        end
+        local segment = unicodeSub(remaining, 1, segmentEnd):gsub("%s+$", "")
+        if segment == "" then
+            segment = unicodeSub(remaining, 1, fitting)
+            nextStart = fitting + 1
+        end
+        wrapped[#wrapped + 1] = segment
+        remaining = unicodeSub(remaining, nextStart):gsub("^%s+", "")
+    end
+    return wrapped
+end
+
+local function fitMeasuredText(gc, text, maximumWidth)
+    if gc:getStringWidth(text) <= maximumWidth then return text end
+    local ellipsis = "…"
+    local fitting = measuredPrefixLength(
+        gc, text, math.max(0, maximumWidth - gc:getStringWidth(ellipsis)))
+    if fitting < 1 then return "" end
+    return unicodeSub(text, 1, fitting) .. ellipsis
+end
+
+local App = {
+    width = 320,
+    height = 217,
+    top = 1,
+    horizontal = 0,
+    fileName = nil,
+    dirty = false,
+    status = "就绪",
+    statusIsError = false,
+    prompt = nil,
+    help = false,
+    helpTop = 1,
+    fileBrowser = nil,
+    running = false,
+    stoppingRun = false,
+    destroyed = false,
+    runHostActive = false,
+    hostActive = true,
+    runEnvironment = nil,
+    input = nil,
+    consoleLines = {},
+    consoleTop = 1,
+    consoleVisible = false,
+    consoleHadError = false,
+    shiftHeld = false,
+    inputResetting = false,
+    selectionLatched = false,
+    undoStack = {},
+    redoStack = {},
+    historyBytes = 0,
+    nextRevision = 1,
+    currentRevision = 1,
+    savedRevision = 1,
+    mergeBlocked = false,
+    savedText = "",
+    recentFiles = Storage.loadRecent(),
+    lastFind = nil,
+    syntaxCache = {},
+    syntaxCacheSize = 0,
+    syntaxValidThrough = 0,
+    syntaxResetVersion = 0,
+    caretVisible = true,
+    caretTicks = 0,
+    settings = { font = "sansserif", fontMode = "r", fontSize = 9, lineHeight = 15,
+                 indentWidth = 4, theme = 1, smartEdit = true }
+}
+
+local function invalidate()
+    if platform and platform.window then
+        platform.window:invalidate()
+    end
+end
+function App:wakeCaret()
+    self.caretVisible = true
+    self.caretTicks = 0
+end
+function App:advanceCaretBlink()
+    if self.prompt or self.help or self.fileBrowser then return end
+    self.caretTicks = self.caretTicks + 1
+    if self.caretTicks >= 12 then
+        self.caretTicks = 0
+        self.caretVisible = not self.caretVisible
+        invalidate()
+    end
+end
+
+
+
+local MAX_UNDO_ENTRIES = 240
+local MAX_UNDO_BYTES = 96 * 1024
+
+local function editBytes(edit)
+    return #(edit.removed or "") + #(edit.inserted or "") + 80
+end
+
+local function documentChanged()
+    if document and document.markChanged then document.markChanged() end
+end
+
+function App:updateDirty()
+    self.dirty = self.currentRevision ~= self.savedRevision
+end
+
+function App:canMergeEdit(previous, edit)
+    if self.mergeBlocked or not previous or previous.kind ~= edit.kind then return false end
+    if previous.after.anchor or edit.before.anchor then return false end
+    if editBytes(previous) + #(edit.removed or "") + #(edit.inserted or "") >
+        MAX_UNDO_BYTES then return false end
+    if edit.kind == "insert" then
+        return previous.removed == "" and edit.removed == "" and
+            not previous.inserted:find("\n", 1, true) and
+            not edit.inserted:find("\n", 1, true) and
+            edit.startRow == previous.newEndRow and edit.startCol == previous.newEndCol
+    end
+    if edit.kind == "backspace" and previous.inserted == "" and edit.inserted == "" then
+        return edit.oldEndRow == previous.startRow and
+            edit.oldEndCol == previous.startCol
+    end
+    if edit.kind == "delete" and previous.inserted == "" and edit.inserted == "" then
+        return edit.startRow == previous.startRow and edit.startCol == previous.startCol
+    end
+    return false
+end
+
+function App:recordEdit(edit)
+    for index = #self.redoStack, 1, -1 do
+        self.historyBytes = self.historyBytes - editBytes(self.redoStack[index])
+        table.remove(self.redoStack, index)
+    end
+    self.nextRevision = self.nextRevision + 1
+    edit.beforeRevision = self.currentRevision
+    edit.afterRevision = self.nextRevision
+    local bytes = editBytes(edit)
+    if bytes > MAX_UNDO_BYTES and self.allowOversizeEdit then
+        self.allowOversizeEdit = false
+        self.undoStack = {}
+        self.redoStack = {}
+        self.historyBytes = 0
+        self.currentRevision = edit.afterRevision
+        self.mergeBlocked = true
+        return
+    end
+    local previous = self.undoStack[#self.undoStack]
+    if self:canMergeEdit(previous, edit) then
+        self.historyBytes = self.historyBytes - editBytes(previous)
+        if edit.kind == "insert" then
+            previous.inserted = previous.inserted .. edit.inserted
+            previous.newEndRow, previous.newEndCol =
+                self.buffer:positionAfter(previous.startRow, previous.startCol, previous.inserted)
+        elseif edit.kind == "backspace" then
+            previous.startRow, previous.startCol = edit.startRow, edit.startCol
+            previous.removed = edit.removed .. previous.removed
+            previous.oldEndRow, previous.oldEndCol =
+                self.buffer:positionAfter(previous.startRow, previous.startCol, previous.removed)
+            previous.newEndRow, previous.newEndCol = edit.newEndRow, edit.newEndCol
+        else
+            previous.removed = previous.removed .. edit.removed
+            previous.oldEndRow, previous.oldEndCol =
+                self.buffer:positionAfter(previous.startRow, previous.startCol, previous.removed)
+        end
+        previous.after = edit.after
+        previous.afterRevision = edit.afterRevision
+        self.historyBytes = self.historyBytes + editBytes(previous)
+    else
+        self.undoStack[#self.undoStack + 1] = edit
+        self.historyBytes = self.historyBytes + editBytes(edit)
+    end
+    self.currentRevision = edit.afterRevision
+    self.mergeBlocked = false
+    while #self.undoStack > MAX_UNDO_ENTRIES or self.historyBytes > MAX_UNDO_BYTES do
+        if #self.undoStack <= 1 then break end
+        self.historyBytes = self.historyBytes - editBytes(self.undoStack[1])
+        table.remove(self.undoStack, 1)
+    end
+end
+
+function App:invalidateSyntaxFrom(row)
+    row = math.max(1, tonumber(row) or 1)
+    for cachedRow in pairs(self.syntaxCache) do
+        if cachedRow >= row then
+            self.syntaxCache[cachedRow] = nil
+            self.syntaxCacheSize = math.max(0, self.syntaxCacheSize - 1)
+        end
+    end
+    self.syntaxValidThrough = math.min(self.syntaxValidThrough, row - 1)
+end
+
+function App:markChanged(edit)
+    if edit then
+        self:recordEdit(edit)
+        self:updateDirty()
+        if self.invalidateSyntaxFrom then self:invalidateSyntaxFrom(edit.startRow) end
+        self:ensureCaretVisible()
+    end
+    self.status = ""
+    self.statusIsError = false
+    self:wakeCaret()
+    documentChanged()
+    invalidate()
+end
+
+App.buffer = Buffer.new("", function(edit) App:markChanged(edit) end)
+App.buffer.codeBefore = function(row, prefix)
+    return App:codeBeforeLine(row, prefix)
+end
+
+function App:resetHistory()
+    self.undoStack = {}
+    self.redoStack = {}
+    self.historyBytes = 0
+    self.nextRevision = self.nextRevision + 1
+    self.currentRevision = self.nextRevision
+    self.savedRevision = self.currentRevision
+    self.mergeBlocked = true
+    self.dirty = false
+end
+
+function App:undo()
+    local edit = table.remove(self.undoStack)
+    if not edit then
+        self:setStatus("没有可撤销的操作")
+        return
+    end
+    self.buffer:applyEdit(edit, true)
+    self:invalidateSyntaxFrom(edit.startRow)
+    self.redoStack[#self.redoStack + 1] = edit
+    self.currentRevision = edit.beforeRevision
+    self.mergeBlocked = true
+    self:updateDirty()
+    self.selectionLatched = false
+    self:ensureCaretVisible()
+    documentChanged()
+    self:setStatus("已撤销")
+end
+
+function App:redo()
+    local edit = table.remove(self.redoStack)
+    if not edit then
+        self:setStatus("没有可重做的操作")
+        return
+    end
+    self.buffer:applyEdit(edit, false)
+    self:invalidateSyntaxFrom(edit.startRow)
+    self.undoStack[#self.undoStack + 1] = edit
+    self.currentRevision = edit.afterRevision
+    self.mergeBlocked = true
+    self:updateDirty()
+    self.selectionLatched = false
+    self:ensureCaretVisible()
+    documentChanged()
+    self:setStatus("已重做")
+end
+
+App:resetHistory()
+
+
+function App:setStatus(message, isError)
+    self.status = tostring(message or "")
+    self.statusIsError = isError == true
+    self:wakeCaret()
+    invalidate()
+end
+function App:appendConsole(...)
+    local values = {}
+    for index = 1, select("#", ...) do
+        values[#values + 1] = tostring(select(index, ...))
+    end
+    local output = table.concat(values, "\t")
+    for _, line in ipairs(splitLines(output)) do
+        self.consoleLines[#self.consoleLines + 1] = line
+    end
+    while #self.consoleLines > MAX_CONSOLE_LINES do
+        table.remove(self.consoleLines, 1)
+    end
+    local rows = math.max(1, math.floor((self.height - STATUS_HEIGHT) /
+        self.settings.lineHeight))
+    self.consoleTop = math.max(1, #self.consoleLines - rows + 1)
+    if not self.running or type(self:runnerHandler("paint")) ~= "function" then
+        self.consoleVisible = true
+    end
+    invalidate()
+end
+
+function App:clearConsole()
+    self.consoleLines = {}
+    self.consoleTop = 1
+    self.consoleVisible = false
+    self.consoleHadError = false
+    invalidate()
+end
+
+function App:toggleConsole()
+    if self.running and self.consoleVisible and
+        type(self:runnerHandler("paint")) ~= "function" then
+        self:setStatus("程序没有绘图事件")
+        return false
+    end
+    if #self.consoleLines == 0 then
+        self:setStatus("运行控制台为空")
+        return false
+    end
+    self.consoleVisible = not self.consoleVisible
+    invalidate()
+    return true
+end
+
+function App:copyConsole()
+    if #self.consoleLines == 0 then
+        self:setStatus("运行控制台为空")
+        return false
+    end
+    clipboard.addText(table.concat(self.consoleLines, "\n"))
+    self:setStatus("已复制运行输出")
+    return true
+end
+
+
+function App:visibleRows()
+    return math.max(1, math.floor(
+        (self.height - STATUS_HEIGHT - EDITOR_CONTENT_TOP_INSET) /
+        self.settings.lineHeight))
+end
+
+function App:overlayVisibleRows()
+    return math.max(1, math.floor(
+        (self.height - STATUS_HEIGHT) / self.settings.lineHeight))
+end
+
+function App:layoutHelp(gc)
+    local lineHeight = self.settings.lineHeight
+    local left = HELP_HORIZONTAL_PADDING
+    local width = math.max(1, self.width - HELP_HORIZONTAL_PADDING * 2)
+    local contentBottom = math.max(0, self.height - STATUS_HEIGHT)
+    gc:setFont(self.settings.font, "b", self.settings.fontSize)
+    local titleLines = wrapMeasuredText(gc, HELP_TITLE, width)
+    local contentTop = math.min(contentBottom,
+        #titleLines * lineHeight + HELP_TITLE_GAP)
+    local lines = {}
+    for _, sourceLine in ipairs(helpLines) do
+        local wrapped = wrapMeasuredText(gc, sourceLine, width)
+        for _, line in ipairs(wrapped) do lines[#lines + 1] = line end
+    end
+    local visibleRows = math.max(0,
+        math.floor((contentBottom - contentTop) / lineHeight))
+    local layout = {
+        left = left,
+        width = width,
+        titleLines = titleLines,
+        lines = lines,
+        contentTop = contentTop,
+        contentBottom = contentBottom,
+        visibleRows = visibleRows
+    }
+    self.helpLayout = layout
+    self.helpTop = clamp(self.helpTop or 1, 1,
+        math.max(1, #lines - visibleRows + 1))
+    return layout
+end
+
+function App:helpMaximumTop()
+    local layout = self.helpLayout
+    if not layout then return math.max(1, #helpLines - self:overlayVisibleRows() + 1) end
+    return math.max(1, #layout.lines - layout.visibleRows + 1)
+end
+
+function App:helpPageRows()
+    local rows = self.helpLayout and self.helpLayout.visibleRows or
+        self:overlayVisibleRows()
+    return math.max(1, rows - 1)
+end
+
+function App:scrollHelp(delta)
+    self.helpTop = clamp((self.helpTop or 1) + delta, 1, self:helpMaximumTop())
+    invalidate()
+end
+
+function App:editorRowAtY(y)
+    local screenRow = math.floor(
+        (y - EDITOR_CONTENT_TOP_INSET) / self.settings.lineHeight)
+    screenRow = clamp(screenRow, 0, self:visibleRows() - 1)
+    return clamp(self.top + screenRow, 1, self.buffer:lineCount())
+end
+
+function App:ensureCaretVisible()
+    local rows = self:visibleRows()
+    if self.buffer.row < self.top then
+        self.top = self.buffer.row
+    elseif self.buffer.row >= self.top + rows then
+        self.top = self.buffer.row - rows + 1
+    end
+    local maximum = math.max(1, self.buffer:lineCount() - rows + 1)
+    self.top = clamp(self.top, 1, maximum)
+end
+
+function App:addRecent(name)
+    if not Storage.validName(name) then return end
+    local updated = { name }
+    for _, recent in ipairs(self.recentFiles) do
+        if recent ~= name and #updated < MAX_RECENT_FILES then
+            updated[#updated + 1] = recent
+        end
+    end
+    self.recentFiles = updated
+    Storage.saveRecent(updated)
+    documentChanged()
+end
+
+function App:removeRecent(name)
+    local updated = {}
+    for _, recent in ipairs(self.recentFiles) do
+        if recent ~= name then updated[#updated + 1] = recent end
+    end
+    self.recentFiles = updated
+    Storage.saveRecent(updated)
+end
+
+function App:ask(label, initial, accept)
+    self.prompt = {
+        kind = "input", label = label, text = initial or "", accept = accept
+    }
+    self.help = false
+    self.fileBrowser = nil
+    self:setStatus(label)
+end
+
+function App:choose(label, choices, accept, cancel)
+    self.prompt = {
+        kind = "choice", label = label, choices = choices,
+        selected = 1, accept = accept, cancel = cancel
+    }
+    self.help = false
+    self.fileBrowser = nil
+    self:setStatus(label)
+end
+
+function App:promptChoice(delta)
+    if not self.prompt or self.prompt.kind ~= "choice" then return false end
+    self.prompt.selected = clamp(self.prompt.selected + delta, 1, #self.prompt.choices)
+    invalidate()
+    return true
+end
+
+function App:acceptPrompt()
+    local prompt = self.prompt
+    if not prompt then return end
+    self.prompt = nil
+    if prompt.kind == "choice" then
+        local choice = prompt.choices[prompt.selected]
+        local value = type(choice) == "table" and choice.value or choice
+        prompt.accept(value, prompt.selected)
+    else
+        prompt.accept(prompt.text)
+    end
+end
+function App:runCompositeEdit(label, bytes, action)
+    if bytes <= MAX_UNDO_BYTES then
+        action()
+        return true
+    end
+    self:choose(label .. "超过96 KiB，执行后无法撤销",
+        { "取消", "继续" },
+        function(choice)
+            if choice ~= "继续" then
+                App:setStatus("已取消")
+                return
+            end
+            App.allowOversizeEdit = true
+            action()
+            App.allowOversizeEdit = false
+        end)
+    return false
+end
+
+function App:reloadCurrentFile()
+    if not self.fileName then return false end
+    local text, message = Storage.load(self.fileName)
+    if not text then
+        self:setStatus("重新载入失败：" .. tostring(message), true)
+        return false
+    end
+    self:_openLoaded(self.fileName, text)
+    self:setStatus("已重新载入 " .. self.fileName)
+    return true
+end
+
+function App:confirmDirty(action, continueAction)
+    if not self.dirty then
+        continueAction()
+        return true
+    end
+    self:choose(action .. "：有未保存修改",
+        { "取消", "放弃", "保存" },
+        function(choice)
+            if choice == "保存" then
+                App:saveFile(nil, continueAction)
+            elseif choice == "放弃" then
+                continueAction()
+            else
+                App:setStatus("已取消")
+            end
+        end)
+    return false
+end
+
+function App:_newFile()
+    self.buffer:setText("")
+    self.fileName = nil
+    self.savedText = ""
+    self.top = 1
+    self.horizontal = 0
+    self:resetHistory()
+    self:setStatus("已新建空白文件")
+end
+
+function App:newFile()
+    return self:confirmDirty("新建文件", function() App:_newFile() end)
+end
+
+function App:_openLoaded(name, text)
+    self.buffer:setText(text)
+    self.fileName = name
+    self.savedText = text
+    self.top = 1
+    self.horizontal = 0
+    self:resetHistory()
+    self:addRecent(name)
+    self:setStatus("已打开 " .. name)
+end
+
+function App:openFile(name)
+    if not Storage.validName(name) then
+        self:setStatus("文件名格式无效", true)
+        return false
+    end
+    local function openLatest()
+        local text, message = Storage.load(name)
+        if not text then
+            App:setStatus(message, true)
+            return false
+        end
+        App:_openLoaded(name, text)
+        return true
+    end
+    if not self.dirty then return openLatest() end
+    self:choose("打开 " .. name .. "：有未保存修改",
+        { "取消", "放弃", "保存" },
+        function(choice)
+            if choice == "放弃" then
+                openLatest()
+            elseif choice == "保存" then
+                if name == App.fileName then
+                    App:saveFile(nil, function()
+                        App:setStatus("已保存；保持当前缓冲")
+                    end)
+                else
+                    App:saveFile(nil, openLatest)
+                end
+            else
+                App:setStatus("已取消")
+            end
+        end)
+    return false
+end
+
+function App:saveFile(name, after, overwriteConfirmed, conflictConfirmed)
+    name = name or self.fileName
+    if not name then
+        self:ask("保存为", "", function(value) App:saveFile(value, after) end)
+        return false
+    end
+    if not Storage.validName(name) then
+        self:setStatus("保存失败：文件名格式无效", true)
+        return false
+    end
+    if self.fileName and not conflictConfirmed then
+        local current = Storage.load(self.fileName)
+        if current ~= self.savedText then
+            self:choose("存储中的 " .. self.fileName .. " 已被外部修改",
+                { "取消", "重新载入", "覆盖" },
+                function(choice)
+                    if choice == "重新载入" then
+                        App:reloadCurrentFile()
+                    elseif choice == "覆盖" then
+                        App:saveFile(name, after, overwriteConfirmed, true)
+                    else
+                        App:setStatus("已取消保存")
+                    end
+                end)
+            return false
+        end
+    end
+    if name ~= self.fileName and Storage.exists(name) and not overwriteConfirmed then
+        self:choose("变量 " .. name .. " 已存在",
+            { "取消", "覆盖" },
+            function(choice)
+                if choice == "覆盖" then
+                    App:saveFile(name, after, true, true)
+                else
+                    App:setStatus("已取消覆盖")
+                end
+            end)
+        return false
+    end
+    local text = self.buffer:text()
+    local ok, message = Storage.save(name, text)
+    if not ok then
+        self:setStatus("保存失败：" .. message, true)
+        return false
+    end
+    self.fileName = name
+    self.savedText = text
+    self.savedRevision = self.currentRevision
+    self.mergeBlocked = true
+    self:updateDirty()
+    self:addRecent(name)
+    self:setStatus("已保存 " .. name)
+    if after then after() end
+    return true
+end
+
+function App:renameFile(name, dirtyConfirmed, overwriteConfirmed, conflictConfirmed)
+    local oldName = self.fileName
+    if not Storage.validName(name) then
+        self:setStatus("重命名失败：文件名格式无效", true)
+        return false
+    end
+    if self.dirty and not dirtyConfirmed then
+        self:choose("重命名会保存当前修改",
+            { "取消", "继续" },
+            function(choice)
+                if choice == "继续" then App:renameFile(name, true, false, false)
+                else App:setStatus("已取消重命名") end
+            end)
+        return false
+    end
+    if not oldName then return self:saveFile(name) end
+    if name == oldName then return self:saveFile(name) end
+    if not conflictConfirmed then
+        local current = Storage.load(oldName)
+        if current ~= self.savedText then
+            self:choose("存储中的 " .. oldName .. " 已被外部修改",
+                { "取消", "重新载入", "覆盖" },
+                function(choice)
+                    if choice == "重新载入" then
+                        App:reloadCurrentFile()
+                    elseif choice == "覆盖" then
+                        App:renameFile(name, true, overwriteConfirmed, true)
+                    else
+                        App:setStatus("已取消重命名")
+                    end
+                end)
+            return false
+        end
+    end
+    if Storage.exists(name) and not overwriteConfirmed then
+        self:choose("变量 " .. name .. " 已存在",
+            { "取消", "覆盖" },
+            function(choice)
+                if choice == "覆盖" then App:renameFile(name, true, true, true)
+                else App:setStatus("已取消覆盖") end
+            end)
+        return false
+    end
+    local text = self.buffer:text()
+    local ok, message = Storage.save(name, text)
+    if not ok then
+        self:setStatus("重命名失败：" .. message, true)
+        return false
+    end
+    local deleted, deleteMessage = Storage.delete(oldName)
+    if not deleted then
+        self.fileName = name
+        self.savedText = text
+        self.savedRevision = self.currentRevision
+        self:updateDirty()
+        self:addRecent(name)
+        self:setStatus("新文件已保存，但旧文件删除失败：" .. deleteMessage, true)
+        return false
+    end
+    self:removeRecent(oldName)
+    self.fileName = name
+    self.savedText = text
+    self.savedRevision = self.currentRevision
+    self.mergeBlocked = true
+    self:updateDirty()
+    self:addRecent(name)
+    self:setStatus("已重命名为 " .. name)
+    return true
+end
+
+function App:deleteFile(confirmed)
+    if not self.fileName then
+        self:setStatus("当前文件尚未保存", true)
+        return false
+    end
+    if not confirmed then
+        local warning = self.dirty and "删除文件并放弃未保存修改" or
+            "删除变量 " .. self.fileName
+        self:choose(warning, { "取消", "删除" }, function(choice)
+            if choice == "删除" then App:deleteFile(true)
+            else App:setStatus("已取消删除") end
+        end)
+        return false
+    end
+    local oldName = self.fileName
+    local ok, message = Storage.delete(oldName)
+    if not ok then
+        self:setStatus("删除失败：" .. message, true)
+        return false
+    end
+    self:removeRecent(oldName)
+    self:_newFile()
+    self:setStatus("已删除 " .. oldName)
+    return true
+end
+
+function App:refreshFileList()
+    local items = Storage.listText(self.recentFiles)
+    if self.fileBrowser then
+        self.fileBrowser.items = items
+        self.fileBrowser.index = clamp(self.fileBrowser.index or 1, 1, math.max(1, #items))
+    end
+    return items
+end
+
+function App:showFileList()
+    local items = Storage.listText(self.recentFiles)
+    if #items == 0 then
+        self:setStatus("没有可打开的文本变量", true)
+        return false
+    end
+    local selected = 1
+    for index, name in ipairs(items) do
+        if name == self.fileName then selected = index break end
+    end
+    self.fileBrowser = { items = items, index = selected, top = 1 }
+    self.prompt = nil
+    self.help = false
+    self:setStatus("文件列表：方向键选择，Enter 打开")
+    return true
+end
+
+function App:openSelectedFile()
+    local browser = self.fileBrowser
+    if not browser or #browser.items == 0 then return false end
+    local name = browser.items[browser.index]
+    self.fileBrowser = nil
+    return self:openFile(name)
+end
+
+function App:cancelOverlay()
+    if self.prompt then
+        local prompt = self.prompt
+        self.prompt = nil
+        if prompt.cancel then prompt.cancel() end
+        self:setStatus("已取消")
+        return true
+    end
+    if self.fileBrowser then
+        self.fileBrowser = nil
+        self:setStatus("已关闭文件列表")
+        return true
+    end
+    if self.help then
+        self.help = false
+        self:setStatus("已关闭帮助")
+        return true
+    end
+    return false
+end
+
+function Buffer:positionToByte(row, col)
+    local offset = 0
+    for index = 1, row - 1 do offset = offset + #self.lines[index] + 1 end
+    return offset + charToByte(self.lines[row], col) - 1
+end
+
+function Buffer:byteToPosition(offset)
+    local remaining = clamp(offset, 0, #self:text())
+    for row, line in ipairs(self.lines) do
+        if remaining <= #line then
+            return row, byteToChar(line, remaining + 1)
+        end
+        remaining = remaining - #line
+        if row < #self.lines then remaining = remaining - 1 end
+    end
+    local row = #self.lines
+    return row, unicodeLength(self.lines[row])
+end
+
+function App:selectByteRange(firstOffset, lastOffset)
+    local firstRow, firstCol = self.buffer:byteToPosition(firstOffset)
+    local lastRow, lastCol = self.buffer:byteToPosition(lastOffset)
+    self.buffer.anchor = { row = firstRow, col = firstCol }
+    self.buffer.row, self.buffer.col = lastRow, lastCol
+    self.buffer.goalCol = nil
+end
+
+function App:findLiteral(query, wrap, direction)
+    if query == "" then
+        self:setStatus("请输入查找内容", true)
+        return false
+    end
+    direction = direction or 1
+    self.lastFind = query
+    local text = self.buffer:text()
+    local found
+    if direction < 0 then
+        local firstRow, firstCol = self.buffer:selectionBounds()
+        local limit = firstRow and self.buffer:positionToByte(firstRow, firstCol) or
+            self.buffer:positionToByte(self.buffer.row, self.buffer.col)
+        local position = 1
+        while true do
+            local nextFound = string.find(text, query, position, true)
+            if not nextFound or nextFound - 1 >= limit then break end
+            found = nextFound
+            position = nextFound + 1
+        end
+        if not found and wrap then
+            position = 1
+            while true do
+                local nextFound = string.find(text, query, position, true)
+                if not nextFound then break end
+                found = nextFound
+                position = nextFound + 1
+            end
+        end
+    else
+        local startOffset = self.buffer:positionToByte(self.buffer.row, self.buffer.col)
+        found = string.find(text, query, startOffset + 1, true)
+        if not found and wrap then found = string.find(text, query, 1, true) end
+    end
+    if not found then
+        self:setStatus("未找到：" .. query, true)
+        return false
+    end
+    self:selectByteRange(found - 1, found - 1 + #query)
+    self.selectionLatched = false
+    self:ensureCaretVisible()
+    self:setStatus((direction < 0 and "向上找到：" or "找到：") .. query)
+    return true
+end
+
+function App:findNext(query)
+    query = query or self.lastFind
+    if not query then
+        self:setStatus("请先输入查找内容", true)
+        return false
+    end
+    return self:findLiteral(query, true, 1)
+end
+
+function App:findPrevious(query)
+    query = query or self.lastFind
+    if not query then
+        self:setStatus("请先输入查找内容", true)
+        return false
+    end
+    return self:findLiteral(query, true, -1)
+end
+
+function App:replaceSelection(replacement)
+    if not self.buffer:hasSelection() then
+        self:setStatus("请先查找或选择文本", true)
+        return
+    end
+    self.buffer:insert(replacement)
+    self:setStatus("已替换当前选择")
+end
+
+local function replaceAllLiteral(text, query, replacement)
+    if query == "" then return text, 0 end
+    local parts = {}
+    local count = 0
+    local position = 1
+    while true do
+        local found = string.find(text, query, position, true)
+        if not found then
+            parts[#parts + 1] = string.sub(text, position)
+            break
+        end
+        parts[#parts + 1] = string.sub(text, position, found - 1)
+        parts[#parts + 1] = replacement
+        position = found + #query
+        count = count + 1
+    end
+    return table.concat(parts), count
+end
+
+function App:replaceAll(query, replacement)
+    if query == "" then
+        self:setStatus("查找内容不能为空", true)
+        return
+    end
+    local oldText = self.buffer:text()
+    local text, count = replaceAllLiteral(oldText, query, replacement)
+    if count == 0 then
+        self:setStatus("已替换 0 处")
+        return
+    end
+    self:runCompositeEdit("全部替换", #oldText + #text + 80, function()
+        local lastRow = App.buffer:lineCount()
+        App.buffer:replaceRange(1, 0, lastRow,
+            unicodeLength(App.buffer.lines[lastRow]), text, "replaceAll")
+        App:setStatus("已替换 " .. count .. " 处")
+    end)
+end
+
+function App:insertSnippet(name)
+    local text = snippets[name]
+    if text then
+        self.buffer:insert(text)
+        self:setStatus("已插入模板：" .. name)
+    end
+end
+
+function App:syntaxCheck()
+    local _, message = loadstring(self.buffer:text(), "@nMoon")
+    if message then
+        local line = tonumber(tostring(message):match(":(%d+):"))
+        if line then
+            self.buffer:setCaret(line, 0, false)
+            self:ensureCaretVisible()
+        end
+        self:setStatus("语法错误：" .. tostring(message), true)
+    else
+        self:setStatus("语法检查通过")
+    end
+end
+
+local RUN_BUDGET_MESSAGE = "运行已中断：超过指令预算（可能存在死循环）"
+local RUN_BUDGET_SENTINEL = {}
+local SAFE_PREVIEW_ERROR = "当前 TI 环境不支持安全预览"
+local RUN_TOP_BUDGET = 600000
+local RUN_EVENT_BUDGET = 240000
+local RUN_HOOK_STEP = 1000
+local unpackValues = unpack or table.unpack
+local nativePcall, nativeXpcall, nativeError = pcall, xpcall, error
+local nativeCoroutineCreate = coroutine and coroutine.create
+local nativeCoroutineResume = coroutine and coroutine.resume
+
+local function packValues(...)
+    return { n = select("#", ...), ... }
+end
+
+local function runError(message)
+    if message == RUN_BUDGET_SENTINEL then return RUN_BUDGET_MESSAGE end
+    return "运行错误：" .. tostring(message or "未知错误")
+end
+
+function App:safePreviewSupported()
+    return type(debug) == "table" and type(debug.sethook) == "function"
+end
+
+function App:attachRunHook(thread)
+    if not self.activeRunHook or not self:safePreviewSupported() or
+        not self.activeHookRecords then return false end
+    if self.activeHookRecords[thread] then return true end
+    local previous, mask, count
+    if type(debug.gethook) == "function" then
+        local got, oldHook, oldMask, oldCount =
+            nativePcall(debug.gethook, thread)
+        if got then previous, mask, count = oldHook, oldMask, oldCount end
+    end
+    local ok = nativePcall(debug.sethook, thread, self.activeRunHook, "",
+        RUN_HOOK_STEP)
+    if not ok then return false end
+    self.activeHookRecords[thread] = {
+        hook = previous, mask = mask, count = count
+    }
+    return true
+end
+
+function App:protectedCall(fn, budget, ...)
+    if not self:safePreviewSupported() then return false, SAFE_PREVIEW_ERROR end
+    local arguments = packValues(...)
+    local remaining = budget or RUN_EVENT_BUDGET
+    local oldHook, oldMask, oldCount
+    if type(debug.gethook) == "function" then
+        local got, previous, mask, count = nativePcall(debug.gethook)
+        if got then oldHook, oldMask, oldCount = previous, mask, count end
+    end
+    local hook = function()
+        remaining = remaining - RUN_HOOK_STEP
+        if remaining <= 0 then nativeError(RUN_BUDGET_SENTINEL, 0) end
+    end
+    local installed = nativePcall(debug.sethook, hook, "", RUN_HOOK_STEP)
+    if not installed then return false, SAFE_PREVIEW_ERROR end
+    self.activeRunHook = hook
+    self.activeHookRecords = {}
+    local function trace(message)
+        if message == RUN_BUDGET_SENTINEL then return message end
+        if type(debug.traceback) == "function" then
+            local ok, traceback = nativePcall(debug.traceback,
+                tostring(message), 2)
+            if ok then return traceback end
+        end
+        return tostring(message)
+    end
+    local results = packValues(nativeXpcall(function()
+        return fn(unpackValues(arguments, 1, arguments.n))
+    end, trace))
+    self.activeRunHook = nil
+    nativePcall(debug.sethook)
+    for thread, previous in pairs(self.activeHookRecords) do
+        nativePcall(debug.sethook, thread)
+        if previous.hook then
+            nativePcall(debug.sethook, thread, previous.hook,
+                previous.mask, previous.count)
+        end
+    end
+    self.activeHookRecords = nil
+    if oldHook then
+        nativePcall(debug.sethook, oldHook, oldMask, oldCount)
+    end
+    return unpackValues(results, 1, results.n)
+end
+
+function App:runnerHandler(name)
+    local runner = self.runEnvironment
+    if not runner or type(runner.on) ~= "table" then return nil end
+    return rawget(runner.on, name)
+end
+function App:callRunner(name, ...)
+    local handler = self:runnerHandler(name)
+    if type(handler) ~= "function" then return true end
+    local ok, message = self:protectedCall(handler, RUN_EVENT_BUDGET, ...)
+    if not ok then
+        self:stopRun(runError(message))
+        return false
+    end
+    if self.runEnvironment and type(self.runEnvironment.on) ~= "table" then
+        self:stopRun("运行错误：on 必须是事件表", true)
+        return false
+    end
+    return true, message
+end
+
+local function safeCopyTable(source, seen)
+    if type(source) ~= "table" then return source end
+    seen = seen or {}
+    if seen[source] then return seen[source] end
+    local copy = {}
+    seen[source] = copy
+    for key, value in pairs(source) do
+        local safeKey = type(key) == "table" and safeCopyTable(key, seen) or key
+        copy[safeKey] = type(value) == "table" and
+            safeCopyTable(value, seen) or value
+    end
+    return copy
+end
+
+function App:createRunEnvironment()
+    local environment = { on = {} }
+    local safePcall = function(fn, ...)
+        local values = packValues(nativePcall(fn, ...))
+        if not values[1] and values[2] == RUN_BUDGET_SENTINEL then
+            nativeError(RUN_BUDGET_SENTINEL, 0)
+        end
+        return unpackValues(values, 1, values.n)
+    end
+    local safeXpcall = function(fn, handler)
+        local values = packValues(nativeXpcall(fn, function(message)
+            return message
+        end))
+        if values[1] then return unpackValues(values, 1, values.n) end
+        if values[2] == RUN_BUDGET_SENTINEL then
+            nativeError(RUN_BUDGET_SENTINEL, 0)
+        end
+        local handled = packValues(nativePcall(handler, values[2]))
+        if not handled[1] then
+            if handled[2] == RUN_BUDGET_SENTINEL then
+                nativeError(RUN_BUDGET_SENTINEL, 0)
+            end
+            return false, handled[2]
+        end
+        return false, unpackValues(handled, 2, handled.n)
+    end
+
+    local basicNames = {
+        "assert", "error", "ipairs", "next", "pairs", "rawequal",
+        "rawget", "rawset", "select", "setmetatable",
+        "tonumber", "tostring", "type"
+    }
+    for _, name in ipairs(basicNames) do environment[name] = _G[name] end
+    environment.unpack = unpackValues
+    environment.pcall = safePcall
+    environment.xpcall = safeXpcall
+    environment.print = function(...) App:appendConsole(...) end
+    environment._VERSION = _VERSION
+    environment._G = environment
+
+    local safeGlobals = {
+        "math", "string", "table", "platform", "clipboard", "var",
+        "document", "toolpalette", "D2Editor", "image", "physics",
+        "locale", "touch", "cursor"
+    }
+    for _, name in ipairs(safeGlobals) do
+        if type(_G[name]) == "table" then
+            environment[name] = safeCopyTable(_G[name])
+        end
+    end
+    if type(_G.class) == "function" then environment.class = _G.class end
+
+    environment.debug = {}
+    if debug then
+        environment.debug.traceback = debug.traceback
+        environment.debug.getinfo = debug.getinfo
+    end
+
+    if coroutine then
+        local coroutineProxy = safeCopyTable(coroutine)
+        coroutineProxy.create = function(fn)
+            local thread = nativeCoroutineCreate(fn)
+            if not App:attachRunHook(thread) then
+                nativeError("无法为协程启用指令预算", 2)
+            end
+            return thread
+        end
+        coroutineProxy.resume = function(thread, ...)
+            if not App:attachRunHook(thread) then
+                return false, "无法为协程启用指令预算"
+            end
+            local values = packValues(nativeCoroutineResume(thread, ...))
+            if not values[1] and values[2] == RUN_BUDGET_SENTINEL then
+                nativeError(RUN_BUDGET_SENTINEL, 0)
+            end
+            return unpackValues(values, 1, values.n)
+        end
+        coroutineProxy.wrap = function(fn)
+            local thread = coroutineProxy.create(fn)
+            return function(...)
+                local values = packValues(coroutineProxy.resume(thread, ...))
+                if not values[1] then nativeError(values[2], 2) end
+                return unpackValues(values, 2, values.n)
+            end
+        end
+        environment.coroutine = coroutineProxy
+    end
+
+    if timer then
+        local timerProxy = safeCopyTable(timer)
+        timerProxy.start = function(first, second)
+            local interval = type(first) == "table" and second or first
+            App.userTimerActive = true
+            App.userTimerInterval = interval
+            if App.runHostActive and timer.start then return timer.start(interval) end
+        end
+        timerProxy.stop = function()
+            App.userTimerActive = false
+            App.userTimerInterval = nil
+            if timer.stop then return timer.stop() end
+        end
+        environment.timer = timerProxy
+    end
+
+    environment.getfenv = function() return environment end
+    environment.setfenv = function()
+        nativeError("运行环境不允许替换全局环境", 2)
+    end
+    environment.loadstring = function(source, chunkName)
+        local loaded, message = loadstring(source, chunkName)
+        if loaded then setfenv(loaded, environment) end
+        return loaded, message
+    end
+    if load then
+        environment.load = function(reader, chunkName)
+            local loaded, message = load(reader, chunkName)
+            if loaded and setfenv then setfenv(loaded, environment) end
+            return loaded, message
+        end
+    end
+    return environment
+end
+
+function App:startRun()
+    local chunk, message = loadstring(self.buffer:text(),
+        "@nMoon/" .. (self.fileName or "untitled"))
+    if not chunk then
+        self:setStatus("语法错误：" .. tostring(message), true)
+        return false
+    end
+    if not self:safePreviewSupported() then
+        self:setStatus(SAFE_PREVIEW_ERROR, true)
+        return false
+    end
+    self:clearConsole()
+    local environment = self:createRunEnvironment()
+    setfenv(chunk, environment)
+    self.runEnvironment = environment
+    self.userTimerActive = false
+    self.userTimerInterval = nil
+    self.runHostActive = true
+    if timer and timer.stop then timer.stop() end
+    local ok, result = self:protectedCall(chunk, RUN_TOP_BUDGET)
+    if not ok then
+        if timer and timer.stop then timer.stop() end
+        self.runEnvironment = nil
+        self.runHostActive = false
+        local failure = runError(result)
+        self.consoleHadError = true
+        self:appendConsole(failure)
+        if timer and timer.start then timer.start(INPUT_POLL_SECONDS) end
+        self:setStatus(failure, true)
+        return false
+    end
+    if type(environment.on) ~= "table" then
+        self:stopRun("运行错误：on 必须是事件表", true)
+        return false
+    end
+    self.running = true
+    if self.input and self.input.setFocus then self.input:setFocus(false) end
+    if self.input and self.input.setVisible then self.input:setVisible(false) end
+    if platform.window.setFocus then platform.window:setFocus(true) end
+    if type(rawget(environment.on, "construction")) == "function" then
+        self:callRunner("construction")
+    elseif type(rawget(environment.on, "create")) == "function" then
+        self:callRunner("create")
+    end
+    if self.running then self:callRunner("resize", self.width, self.height) end
+    if self.running then self:callRunner("activate") end
+    if not self.running then return false end
+    local hasHandler = false
+    for _, handler in next, environment.on do
+        if type(handler) == "function" then hasHandler = true break end
+    end
+    local hasPaint = type(self:runnerHandler("paint")) == "function"
+    if not hasHandler and #self.consoleLines == 0 then
+        self:appendConsole("程序执行完成（无输出）")
+    elseif not hasPaint and #self.consoleLines == 0 then
+        self:appendConsole("程序正在运行（无绘图输出）")
+    end
+    self.consoleVisible = not hasPaint
+    if self.registerRunMenu then self:registerRunMenu() end
+    invalidate()
+    return true
+end
+
+function App:stopRun(message, skipLifecycle)
+    if self.stoppingRun then return end
+    self.stoppingRun = true
+    local environment = self.runEnvironment
+    local lifecycleError
+    if environment and type(environment.on) == "table" and not skipLifecycle then
+        for _, name in ipairs({ "deactivate", "destroy" }) do
+            local handler = rawget(environment.on, name)
+            if type(handler) == "function" then
+                local ok, result = self:protectedCall(handler, RUN_EVENT_BUDGET)
+                if not ok and not lifecycleError then lifecycleError = runError(result) end
+            end
+        end
+    end
+    if timer and timer.stop then timer.stop() end
+    self.userTimerActive = false
+    self.userTimerInterval = nil
+    self.runHostActive = false
+    self.running = false
+    self.runEnvironment = nil
+    local failure = message or lifecycleError
+    if failure then
+        self.consoleHadError = true
+        self:appendConsole(failure)
+        self.consoleVisible = true
+    else
+        self.consoleVisible = false
+    end
+    if self.input and self.input.setVisible then self.input:setVisible(true) end
+    self:resetInputShadow()
+    if self.input and self.input.setFocus then self.input:setFocus(true) end
+    if not self.destroyed and self.hostActive and timer and timer.start then
+        timer.start(INPUT_POLL_SECONDS)
+    end
+    if not self.destroyed and self.hostActive then self:registerMenu() end
+    self.stoppingRun = false
+    self:setStatus(failure or "已返回 nMoon", failure ~= nil)
+end
+
+function App:destroyRun()
+    if self.stoppingRun then return end
+    self.stoppingRun = true
+    local handler = self:runnerHandler("destroy")
+    if type(handler) == "function" then
+        self:protectedCall(handler, RUN_EVENT_BUDGET)
+    end
+    if timer and timer.stop then timer.stop() end
+    self.userTimerActive = false
+    self.userTimerInterval = nil
+    self.runHostActive = false
+    self.running = false
+    self.runEnvironment = nil
+    self.stoppingRun = false
+end
+
+function App:copy()
+    local text = self.buffer:selectedText()
+    if not text then text = self.buffer:line() .. "\n" end
+    clipboard.addText(text)
+    self:setStatus("已复制")
+end
+
+function App:cut()
+    if self.buffer:hasSelection() then
+        self:copy()
+        self.buffer:deleteSelection()
+    else
+        clipboard.addText(self.buffer:line() .. "\n")
+        self.buffer:deleteLine()
+    end
+    self:setStatus("已剪切")
+end
+
+function App:paste(text)
+    local value = text or clipboard.getText()
+    if not value or value == "" then return end
+    local removed = self.buffer:selectedText() or ""
+    self:runCompositeEdit("粘贴内容", #removed + #value + 80, function()
+        App.buffer:insert(value, "paste")
+        App:setStatus("已粘贴")
+    end)
+end
+
+function App:cycleTheme()
+    self.settings.theme = self.settings.theme % #themes + 1
+    self:markChanged()
+    self:setStatus("已切换配色")
+end
+
+function App:cycleFontSize()
+    local sizes = { 7, 9, 10, 11, 12, 24 }
+    local nextSize = sizes[1]
+    for index, size in ipairs(sizes) do
+        if size == self.settings.fontSize then
+            nextSize = sizes[index % #sizes + 1]
+            break
+        end
+    end
+    self.settings.fontSize = nextSize
+    self.settings.lineHeight = nextSize + 6
+    self:ensureCaretVisible()
+    self:markChanged()
+    self:setStatus("字号：" .. nextSize)
+end
+
+function App:toggleIndent()
+    self.settings.indentWidth = self.settings.indentWidth == 4 and 2 or 4
+    self:markChanged()
+    self:setStatus("缩进宽度：" .. self.settings.indentWidth)
+end
+
+function App:toggleSmartEdit()
+    self.settings.smartEdit = not self.settings.smartEdit
+    self:markChanged()
+    self:setStatus(self.settings.smartEdit and "智能编辑：开" or "智能编辑：关")
+end
+function App:changeIndent(outdent)
+    local firstRow, _, lastRow = self.buffer:selectionBounds()
+    firstRow = firstRow or self.buffer.row
+    lastRow = lastRow or self.buffer.row
+    local oldText = self.buffer:textRange(firstRow, 0, lastRow,
+        unicodeLength(self.buffer.lines[lastRow]))
+    local extra = (lastRow - firstRow + 1) * self.settings.indentWidth
+    local estimated = #oldText * 2 + extra + 80
+    self:runCompositeEdit(outdent and "减少缩进" or "缩进", estimated,
+        function()
+            if outdent then
+                App.buffer:outdent(App.settings.indentWidth)
+            else
+                App.buffer:indent(string.rep(" ", App.settings.indentWidth))
+            end
+        end)
+end
+
+function App:moveHome(extend)
+    self.buffer:setCaret(self.buffer.row, 0, extend)
+    self.mergeBlocked = true
+    self:ensureCaretVisible()
+    invalidate()
+end
+
+function App:moveEnd(extend)
+    self.buffer:setCaret(self.buffer.row,
+        unicodeLength(self.buffer:line()), extend)
+    self.mergeBlocked = true
+    self:ensureCaretVisible()
+    invalidate()
+end
+
+function App:movePage(delta, extend)
+    local amount = math.max(1, self:visibleRows() - 1)
+    self.buffer:moveVertical(delta * amount, extend)
+    self.top = clamp(self.top + delta * amount, 1,
+        math.max(1, self.buffer:lineCount() - self:visibleRows() + 1))
+    self.mergeBlocked = true
+    self:ensureCaretVisible()
+    invalidate()
+end
+
+function App:moveWord(delta, extend)
+    self.buffer:moveWord(delta, extend)
+    self.mergeBlocked = true
+    self:ensureCaretVisible()
+    invalidate()
+end
+
+function App:deleteWord(delta)
+    self.buffer:deleteWord(delta)
+    self:ensureCaretVisible()
+end
+
+function App:showHelp()
+    self.help = true
+    self.helpTop = 1
+    self.prompt = nil
+    self.fileBrowser = nil
+    invalidate()
+end
+
+function App:selectAll()
+    self.buffer:selectAll()
+    self.selectionLatched = false
+    self:setStatus("已全选")
+end
+
+function App:handleShortcut(key)
+    if self.running or self.prompt or self.help or self.fileBrowser then return false end
+    key = string.lower(tostring(key or ""))
+    if key == "a" then self:selectAll()
+    elseif key == "c" then self:copy()
+    elseif key == "x" then self:cut()
+    elseif key == "v" then self:paste()
+    elseif key == "z" then self:undo()
+    elseif key == "y" then self:redo()
+    elseif key == "s" then self:saveFile()
+    elseif key == "f" then self:ask("查找", "", function(value) App:findLiteral(value, true) end)
+    elseif key == "n" then self:newFile()
+    elseif key == "o" then self:ask("打开文件", "", function(value) App:openFile(value) end)
+    elseif key == "r" then self:startRun()
+    else return false end
+    return true
+end
+
+local controlShortcuts = {
+    [1] = "a", [3] = "c", [6] = "f", [14] = "n", [15] = "o",
+    [18] = "r", [19] = "s", [22] = "v", [24] = "x", [25] = "y", [26] = "z"
+}
+
+function App:handleTextInput(text)
+    if #text == 1 then
+        local shortcut = controlShortcuts[string.byte(text)]
+        if shortcut and self:handleShortcut(shortcut) then return end
+    end
+    if self.prompt then
+        if self.prompt.kind == "choice" then
+            local number = tonumber(text)
+            if number and number >= 1 and number <= #self.prompt.choices then
+                self.prompt.selected = number
+                self:acceptPrompt()
+            end
+        else
+            self.prompt.text = self.prompt.text .. text
+            invalidate()
+        end
+        return
+    end
+    if self.fileBrowser or self.help then return end
+    if self.running then
+        self:callRunner("charIn", text)
+        return
+    end
+    local selected = self.buffer:selectedText() or ""
+    local estimated = #selected * 2 + #text + 82
+    self:runCompositeEdit("输入内容", estimated, function()
+        App.selectionLatched = false
+        if App.settings.smartEdit and unicodeLength(text) == 1 then
+            local pairs = { ["("] = ")", ["["] = "]", ["{"] = "}",
+                            ["\""] = "\"", ["'"] = "'" }
+            local closing = { [")"] = true, ["]"] = true, ["}"] = true,
+                              ["\""] = true, ["'"] = true }
+            local hasSelection = App.buffer:hasSelection()
+            local nextCharacter = unicodeSub(App.buffer:line(),
+                App.buffer.col + 1, App.buffer.col + 1)
+            if not hasSelection then
+                local prefix = unicodeSub(App.buffer:line(), 1, App.buffer.col)
+                local candidate = prefix .. text
+                local code = App:codeBeforeLine(App.buffer.row, candidate)
+                local indentation, closer = code:match("^(%s+)([%a]+)%s*$")
+                if not indentation and text == "}" then
+                    indentation, closer = code:match("^(%s+)(})%s*$")
+                end
+                local closers = { ["end"] = true, ["else"] = true,
+                                  ["elseif"] = true, ["until"] = true,
+                                  ["}"] = true }
+                if indentation and closers[closer] then
+                    local width = math.min(unicodeLength(indentation),
+                        App.settings.indentWidth)
+                    local replacement = unicodeSub(candidate, width + 1)
+                    local oldEndCol = App.buffer.col
+                    if text == "}" and nextCharacter == "}" then
+                        oldEndCol = oldEndCol + 1
+                    end
+                    App.buffer:replaceRange(App.buffer.row, 0,
+                        App.buffer.row, oldEndCol, replacement, "smart")
+                    return
+                end
+            end
+            if closing[text] and nextCharacter == text and not hasSelection then
+                App.buffer:moveHorizontal(1, false)
+                App.mergeBlocked = true
+                invalidate()
+                return
+            elseif pairs[text] then
+                App.buffer:insertPair(text, pairs[text])
+                return
+            end
+        end
+        App.buffer:insert(text, "insert")
+    end)
+end
+
+function App:registerMenu()
+    if not toolpalette then return end
+    toolpalette.register({
+        { "文件",
+          { "新建    Ctrl+N", function() App:newFile() end },
+          { "打开…   Ctrl+O", function() App:ask("打开文件", "", function(value) App:openFile(value) end) end },
+          { "文件列表 / 最近", function() App:showFileList() end },
+          { "保存    Ctrl+S", function() App:saveFile() end },
+          { "另存为…", function() App:ask("另存为", App.fileName or "", function(value) App:saveFile(value) end) end },
+          { "重命名…", function() App:ask("重命名为", App.fileName or "", function(value) App:renameFile(value) end) end },
+          "-",
+          { "删除当前文件", function() App:deleteFile() end } },
+        { "编辑",
+          { "查找…   Ctrl+F", function() App:ask("查找", App.lastFind or "", function(value) App:findLiteral(value, true) end) end },
+          { "查找下一个", function() App:findNext() end },
+          { "查找上一个", function() App:findPrevious() end },
+          { "替换当前选择…", function() App:ask("替换为", "", function(value) App:replaceSelection(value) end) end },
+          { "全部替换…", function()
+                App:ask("查找内容", "", function(query)
+                    App:ask("替换为", "", function(value) App:replaceAll(query, value) end)
+                end)
+            end },
+          "-",
+          { "撤销    Ctrl+Z", function() App:undo() end },
+          { "重做    Ctrl+Y", function() App:redo() end },
+          "-",
+          { "全选    Ctrl+A", function() App:selectAll() end },
+          { "复制    Ctrl+C", function() App:copy() end },
+          { "剪切    Ctrl+X", function() App:cut() end },
+          { "粘贴    Ctrl+V", function() App:paste() end },
+          "-",
+          { "行首", function() App:moveHome(false) end },
+          { "行尾", function() App:moveEnd(false) end },
+          { "向上翻页", function() App:movePage(-1, false) end },
+          { "向下翻页", function() App:movePage(1, false) end },
+          { "删除前一个词", function() App:deleteWord(-1) end },
+          { "删除后一个词", function() App:deleteWord(1) end } },
+        { "代码",
+          { "语法检查", function() App:syntaxCheck() end },
+          { "运行    Ctrl+R / Esc返回", function() App:startRun() end },
+          "-",
+          { "插入函数模板", function() App:insertSnippet("函数") end },
+          { "插入条件模板", function() App:insertSnippet("条件") end },
+          { "插入循环模板", function() App:insertSnippet("循环") end },
+          { "插入绘图事件", function() App:insertSnippet("事件") end } },
+        { "视图",
+          { "切换配色", function() App:cycleTheme() end },
+          { "切换字号", function() App:cycleFontSize() end },
+          { "切换缩进 2/4", function() App:toggleIndent() end },
+          { "智能编辑 开/关", function() App:toggleSmartEdit() end },
+          "-",
+          { "帮助", function() App:showHelp() end },
+          { APP_NAME .. " " .. APP_VERSION, function() App:setStatus("中文 TI-Nspire Lua 编辑器") end },
+          "-",
+          { "查看 / 关闭运行输出", function() App:toggleConsole() end },
+          { "复制运行输出", function() App:copyConsole() end },
+          { "清空运行输出", function() App:clearConsole() end } }
+    })
+
+    if toolpalette.enableCopy then toolpalette.enableCopy(true) end
+    if toolpalette.enableCut then toolpalette.enableCut(true) end
+    if toolpalette.enablePaste then toolpalette.enablePaste(true) end
+end
+function App:registerRunMenu()
+    if not toolpalette then return end
+    toolpalette.register({
+        { "预览",
+          { "切换图形 / 控制台    Tab", function() App:toggleConsole() end },
+          { "复制运行输出", function() App:copyConsole() end },
+          { "清空运行输出", function() App:clearConsole() end },
+          "-",
+          { "退出预览    Esc", function() App:stopRun() end } }
+    })
+end
+
+local function insertedDifference(current, baseline)
+    if current == baseline then return nil end
+    local prefix = 0
+    local prefixLimit = math.min(#current, #baseline)
+    while prefix < prefixLimit and
+        string.byte(current, prefix + 1) == string.byte(baseline, prefix + 1) do
+        prefix = prefix + 1
+    end
+    local suffix = 0
+    while suffix < #baseline - prefix and
+        string.byte(current, #current - suffix) == string.byte(baseline, #baseline - suffix) do
+        suffix = suffix + 1
+    end
+    local last = #current - suffix
+    if last < prefix + 1 then return nil end
+    return string.sub(current, prefix + 1, last)
+end
+
+function App:resetInputShadow()
+    if not self.input then return end
+    self.inputResetting = true
+    self.input:setText(INPUT_SHADOW, INPUT_SHADOW_CURSOR, -1)
+    self.inputResetting = false
+end
+
+function App:pollInputNavigation()
+    if not self.input or not self.input.getExpressionSelection then return end
+    local _, cursorPosition, selectionPosition = self.input:getExpressionSelection()
+    if type(cursorPosition) ~= "number" then return end
+    local shadowEnd = #INPUT_SHADOW + 1
+    if type(selectionPosition) == "number" and
+        math.min(cursorPosition, selectionPosition) <= 1 and
+        math.max(cursorPosition, selectionPosition) >= shadowEnd then
+        self:resetInputShadow()
+        self:selectAll()
+        return
+    end
+    if cursorPosition == INPUT_SHADOW_CURSOR then return end
+    local delta = cursorPosition - INPUT_SHADOW_CURSOR
+    local shifted = type(selectionPosition) == "number" and
+        selectionPosition >= 1 and selectionPosition ~= cursorPosition
+    local distance = math.abs(delta)
+    local direction
+    local steps
+    if distance >= INPUT_SHADOW_STRIDE - 2 then
+        direction = delta < 0 and "up" or "down"
+        steps = math.max(1, math.floor((distance + INPUT_SHADOW_STRIDE / 2) / INPUT_SHADOW_STRIDE))
+    else
+        direction = delta < 0 and "left" or "right"
+        steps = distance
+    end
+    self:resetInputShadow()
+    for _ = 1, steps do on.arrowKey(direction, shifted) end
+end
+
+function App:setupInput()
+    if not D2Editor or not D2Editor.newRichText then return end
+    self.input = D2Editor.newRichText()
+    self.input:move(self.width + 1, self.height + 1)
+    self.input:resize(1, 1)
+    if self.input.setSelectable then self.input:setSelectable(true) end
+    if self.input.setDisable2DinRT then self.input:setDisable2DinRT(true) end
+    self.input:setTextChangeListener(function(editor)
+        if App.inputResetting then return end
+        local text = (editor or App.input):getText()
+        local inserted = insertedDifference(text, INPUT_SHADOW)
+        App:resetInputShadow()
+        if not inserted or inserted == "" then return end
+        App:handleTextInput(inserted)
+    end)
+    if self.input.registerFilter then
+        self.input:registerFilter({
+            arrowKey = function(direction)
+                on.arrowKey(direction)
+                return true
+            end,
+            backspaceKey = function()
+                on.backspaceKey()
+                return true
+            end,
+            deleteKey = function()
+                on.deleteKey()
+                return true
+            end,
+            clearKey = function()
+                on.clearKey()
+                return true
+            end,
+            enterKey = function()
+                on.enterKey()
+                return true
+            end,
+            returnKey = function()
+                on.returnKey()
+                return true
+            end,
+            tabKey = function()
+                on.tabKey()
+                return true
+            end,
+            backTabKey = function()
+                on.backTabKey()
+                return true
+            end,
+            copy = function()
+                on.copy()
+                return true
+            end,
+            cut = function()
+                on.cut()
+                return true
+            end,
+            paste = function()
+                on.paste()
+                return true
+            end,
+            escapeKey = function()
+                on.escapeKey()
+                return true
+            end,
+            contextMenu = function()
+                on.contextMenu()
+                return true
+            end,
+            grabDown = function()
+                on.grabDown()
+                return true
+            end
+        })
+    end
+    self:resetInputShadow()
+    self.input:setFocus(true)
+end
+
+function App:columnAtPixel(gc, line, pixel)
+    local target = math.max(0, pixel + self.horizontal)
+    local length = unicodeLength(line)
+    local low, high = 0, length
+    while low < high do
+        local middle = math.floor((low + high + 1) / 2)
+        if gc:getStringWidth(unicodeSub(line, 1, middle)) <= target then
+            low = middle
+        else
+            high = middle - 1
+        end
+    end
+    if low >= length then return length end
+    local leftWidth = low == 0 and 0 or
+        gc:getStringWidth(unicodeSub(line, 1, low))
+    local rightWidth = gc:getStringWidth(unicodeSub(line, 1, low + 1))
+    if target * 2 >= leftWidth + rightWidth then return low + 1 end
+    return low
+end
+local function fitText(gc, text, maximumWidth)
+    if maximumWidth <= 0 then return "" end
+    if gc:getStringWidth(text) <= maximumWidth then return text end
+    local suffix = "..."
+    local suffixWidth = gc:getStringWidth(suffix)
+    if suffixWidth >= maximumWidth then return "" end
+    local low, high = 0, unicodeLength(text)
+    while low < high do
+        local middle = math.floor((low + high + 1) / 2)
+        if gc:getStringWidth(unicodeSub(text, 1, middle)) + suffixWidth <= maximumWidth then
+            low = middle
+        else
+            high = middle - 1
+        end
+    end
+    return unicodeSub(text, 1, low) .. suffix
+end
+function App:syncSyntaxCache()
+    if self.syntaxResetVersion == self.buffer.resetVersion then return end
+    self.syntaxCache = {}
+    self.syntaxCacheSize = 0
+    self.syntaxValidThrough = 0
+    self.syntaxResetVersion = self.buffer.resetVersion
+end
+
+function App:syntaxForLine(row, line)
+    self:syncSyntaxCache()
+    if row < 1 then return {} end
+    local source = line or self.buffer.lines[row] or ""
+    local cached = self.syntaxCache[row]
+    if row <= self.syntaxValidThrough and
+        (not cached or cached.line ~= source) then
+        self:invalidateSyntaxFrom(row)
+        cached = nil
+    end
+    if row > self.syntaxValidThrough then
+        local state
+        if self.syntaxValidThrough > 0 then
+            state = self.syntaxCache[self.syntaxValidThrough].outputState
+        end
+        for index = self.syntaxValidThrough + 1, row do
+            local currentLine = index == row and source or
+                (self.buffer.lines[index] or "")
+            local segments, outputState = syntaxSegments(currentLine, state)
+            if not self.syntaxCache[index] then
+                self.syntaxCacheSize = self.syntaxCacheSize + 1
+            end
+            self.syntaxCache[index] = {
+                line = currentLine,
+                inputState = state,
+                outputState = outputState,
+                segments = segments
+            }
+            state = outputState
+        end
+        self.syntaxValidThrough = row
+        cached = self.syntaxCache[row]
+    end
+    return cached and cached.segments or {}
+end
+
+function App:lexerStateBefore(row)
+    self:syncSyntaxCache()
+    if row <= 1 then return nil end
+    self:syntaxForLine(row - 1, self.buffer.lines[row - 1])
+    local cached = self.syntaxCache[row - 1]
+    return cached and cached.outputState or nil
+end
+
+function App:codeBeforeLine(row, prefix)
+    return lexicalCodeBefore(self.buffer.lines, row, prefix,
+        self:lexerStateBefore(row), true)
+end
+
+function App:drawCodeLine(gc, row, line, x, y, theme, leftEdge, clipped)
+    for _, segment in ipairs(self:syntaxForLine(row, line)) do
+        local width = gc:getStringWidth(segment.text)
+        local drawX, drawText = x, segment.text
+        if not clipped and drawX < leftEdge and drawX + width >= leftEdge then
+            local target = leftEdge - drawX
+            local low, high = 0, unicodeLength(drawText)
+            while low < high do
+                local middle = math.floor((low + high) / 2)
+                if gc:getStringWidth(unicodeSub(drawText, 1, middle)) < target then
+                    low = middle + 1
+                else
+                    high = middle
+                end
+            end
+            local skippedWidth = low == 0 and 0 or
+                gc:getStringWidth(unicodeSub(drawText, 1, low))
+            drawX = drawX + skippedWidth
+            drawText = unicodeSub(drawText, low + 1)
+        end
+        if drawText ~= "" and drawX < self.width and
+            ((clipped and drawX + width >= leftEdge) or drawX >= leftEdge) then
+            gc:setColorRGB(theme[segment.kind] or theme.text)
+            gc:drawString(drawText, drawX, y, "bottom")
+        end
+        x = x + width
+        if x >= self.width then break end
+    end
+end
+
+
+
+function App:drawHelp(gc)
+    local theme = themes[self.settings.theme]
+    gc:setColorRGB(theme.background)
+    gc:fillRect(0, 0, self.width, self.height)
+    local layout = self:layoutHelp(gc)
+    local canClip = type(gc.clipRect) == "function"
+
+    gc:setFont(self.settings.font, "b", self.settings.fontSize)
+    gc:setColorRGB(theme.text)
+    if canClip then
+        gc:clipRect("set", layout.left, 0, layout.width, layout.contentBottom)
+    end
+    for index, line in ipairs(layout.titleLines) do
+        local baseline = index * self.settings.lineHeight
+        if baseline > layout.contentBottom then break end
+        gc:drawString(line, layout.left, baseline, "bottom")
+    end
+    if canClip then gc:clipRect("reset") end
+
+    local contentHeight = math.max(0, layout.contentBottom - layout.contentTop)
+    if canClip and contentHeight > 0 then
+        gc:clipRect("set", layout.left, layout.contentTop,
+            layout.width, contentHeight)
+    end
+    for screenRow = 1, layout.visibleRows do
+        local line = layout.lines[self.helpTop + screenRow - 1]
+        if line == nil then break end
+        local baseline = layout.contentTop + screenRow * self.settings.lineHeight
+        gc:drawString(line, layout.left, baseline, "bottom")
+    end
+    if canClip and contentHeight > 0 then gc:clipRect("reset") end
+
+    gc:setColorRGB(theme.status)
+    gc:fillRect(0, self.height - STATUS_HEIGHT, self.width, STATUS_HEIGHT)
+    gc:setColorRGB(theme.statusText)
+    gc:setFont(self.settings.font, "r", STATUS_FONT_SIZE)
+    local hint = fitMeasuredText(gc,
+        "帮助 · ↑↓/PgUp/PgDn滚动 · Esc关闭", math.max(0, self.width - 8))
+    gc:drawString(hint, 4, self.height - STATUS_BOTTOM_PADDING, "bottom")
+end
+
+function App:drawFileBrowser(gc)
+    local browser = self.fileBrowser
+    local theme = themes[self.settings.theme]
+    local lineHeight = self.settings.lineHeight
+    local rows = self:overlayVisibleRows()
+    browser.top = clamp(browser.top or 1, 1, math.max(1, #browser.items - rows + 1))
+    if browser.index < browser.top then browser.top = browser.index end
+    if browser.index >= browser.top + rows then
+        browser.top = browser.index - rows + 1
+    end
+    gc:setColorRGB(theme.background)
+    gc:fillRect(0, 0, self.width, self.height)
+    gc:setFont(self.settings.font, self.settings.fontMode, self.settings.fontSize)
+    for screenRow = 1, rows do
+        local index = browser.top + screenRow - 1
+        local name = browser.items[index]
+        if not name then break end
+        local y = (screenRow - 1) * lineHeight
+        if index == browser.index then
+            gc:setColorRGB(theme.selection)
+            gc:fillRect(0, y, self.width, lineHeight)
+        end
+        gc:setColorRGB(index == browser.index and theme.accent or theme.text)
+        local marker = name == self.fileName and "● " or "  "
+        gc:drawString(marker .. name, 10, y + lineHeight - 2, "bottom")
+    end
+    gc:setColorRGB(theme.status)
+    gc:fillRect(0, self.height - STATUS_HEIGHT, self.width, STATUS_HEIGHT)
+    gc:setColorRGB(theme.statusText)
+    gc:setFont(self.settings.font, "r", STATUS_FONT_SIZE)
+    gc:drawString("文件列表 · ↑↓选择 · Enter打开 · Esc关闭",
+        4, self.height - STATUS_BOTTOM_PADDING, "bottom")
+end
+
+function App:drawConsole(gc)
+    local theme = themes[self.settings.theme]
+    gc:setColorRGB(theme.background)
+    gc:fillRect(0, 0, self.width, self.height)
+    gc:setColorRGB(theme.status)
+    gc:fillRect(0, 0, self.width, STATUS_HEIGHT)
+    gc:setColorRGB(theme.statusText)
+    gc:setFont(self.settings.font, "b", STATUS_FONT_SIZE)
+    local consoleHint = self.running and
+        "nMoon 运行输出 · Tab 图形 · Esc 退出" or
+        "nMoon 运行输出 · Esc 关闭"
+    gc:drawString(consoleHint, 4, STATUS_HEIGHT - STATUS_BOTTOM_PADDING, "bottom")
+    gc:setFont(self.settings.font, "r", self.settings.fontSize)
+    gc:setColorRGB(theme.text)
+    local rows = math.max(1, math.floor((self.height - STATUS_HEIGHT) / self.settings.lineHeight))
+    for index = 1, rows do
+        local line = self.consoleLines[self.consoleTop + index - 1]
+        if line == nil then break end
+        local y = STATUS_HEIGHT + index * self.settings.lineHeight - 2
+        gc:drawString(line, 4, y, "bottom")
+    end
+end
+
+function App:drawEditor(gc)
+    if self.fileBrowser then
+        self:drawFileBrowser(gc)
+        return
+    end
+    if self.help then
+        self:drawHelp(gc)
+        return
+    end
+    local theme = themes[self.settings.theme]
+    local lineHeight = self.settings.lineHeight
+    local rows = self:visibleRows()
+    local contentHeight = self.height - STATUS_HEIGHT
+    gc:setFont(self.settings.font, self.settings.fontMode, self.settings.fontSize)
+    local gutterWidth = math.max(24, gc:getStringWidth(tostring(self.buffer:lineCount())) + 10)
+    local codeX = gutterWidth + EDITOR_TEXT_INSET
+    local codeClipLeft = gutterWidth + EDITOR_TEXT_CLIP_INSET
+    local codeClipWidth = math.max(0, self.width - codeClipLeft)
+    local hasCodeClip = type(gc.clipRect) == "function"
+
+    if self.mouseDrag and self.mouseDrag.kind == "text" then
+        local drag = self.mouseDrag
+        local originLine = self.buffer.lines[drag.originRow]
+        local currentLine = self.buffer.lines[drag.row]
+        local originColumn = self:columnAtPixel(gc, originLine,
+            drag.originX - codeX)
+        local currentColumn = self:columnAtPixel(gc, currentLine,
+            drag.x - codeX)
+        self.buffer:setCaret(drag.originRow, originColumn, false)
+        if drag.row ~= drag.originRow or currentColumn ~= originColumn then
+            self.buffer:setCaret(drag.row, currentColumn, true)
+        end
+        self:ensureCaretVisible()
+        if not drag.active then self.mouseDrag = nil end
+    end
+
+    local caretPrefix = unicodeSub(self.buffer:line(), 1, self.buffer.col)
+    local caretPixel = gc:getStringWidth(caretPrefix)
+    local viewportWidth = self.width - codeX - EDITOR_TEXT_RIGHT_INSET
+    if caretPixel < self.horizontal then
+        self.horizontal = math.max(0, caretPixel - 12)
+    elseif caretPixel > self.horizontal + viewportWidth then
+        self.horizontal = caretPixel - viewportWidth + 12
+    end
+
+    gc:setColorRGB(theme.background)
+    gc:fillRect(0, 0, self.width, contentHeight)
+    gc:setColorRGB(theme.gutter)
+    gc:fillRect(0, 0, gutterWidth, contentHeight)
+    gc:setColorRGB(theme.border)
+    gc:drawLine(gutterWidth - 1, 0, gutterWidth - 1, contentHeight)
+
+    local firstRow, firstCol, lastRow, lastCol = self.buffer:selectionBounds()
+    for screenRow = 1, rows do
+        local row = self.top + screenRow - 1
+        if row > self.buffer:lineCount() then break end
+        local y = EDITOR_CONTENT_TOP_INSET + (screenRow - 1) * lineHeight
+        local textBaseline = y + lineHeight - EDITOR_TEXT_BASELINE_OFFSET
+        local line = self.buffer.lines[row]
+        if row == self.buffer.row then
+            gc:setColorRGB(theme.current)
+            gc:fillRect(gutterWidth, y, self.width - gutterWidth, lineHeight)
+            gc:setColorRGB(theme.accent)
+            gc:fillRect(gutterWidth, y, 2, lineHeight)
+        end
+        if firstRow and row >= firstRow and row <= lastRow then
+            local fromCol = row == firstRow and firstCol or 0
+            local toCol = row == lastRow and lastCol or unicodeLength(line)
+            local left = codeX - self.horizontal +
+                gc:getStringWidth(unicodeSub(line, 1, fromCol))
+            local selectionWidth = gc:getStringWidth(
+                unicodeSub(line, fromCol + 1, toCol))
+            if selectionWidth == 0 then selectionWidth = 3 end
+            local visibleLeft = math.max(codeClipLeft, left)
+            local visibleRight = math.min(self.width, left + selectionWidth)
+            if visibleRight > visibleLeft then
+                gc:setColorRGB(theme.selection)
+                gc:fillRect(visibleLeft, y, visibleRight - visibleLeft, lineHeight)
+            end
+        end
+        local number = tostring(row)
+        gc:setColorRGB(row == self.buffer.row and theme.accent or theme.muted)
+        gc:drawString(number, gutterWidth - 5 - gc:getStringWidth(number),
+            textBaseline, "bottom")
+        if hasCodeClip then
+            gc:clipRect("set", codeClipLeft, 0, codeClipWidth, contentHeight)
+        end
+        self:drawCodeLine(gc, row, line, codeX - self.horizontal,
+            textBaseline, theme, codeClipLeft, hasCodeClip)
+        if row == 1 and line == "" and self.buffer:lineCount() == 1 and
+            not self.dirty and (hasCodeClip or codeX - self.horizontal >= codeClipLeft) then
+            gc:setColorRGB(theme.muted)
+            gc:drawString("输入 Lua 代码…", codeX - self.horizontal,
+                textBaseline, "bottom")
+        end
+        if hasCodeClip then gc:clipRect("reset") end
+    end
+
+    local caretScreenRow = self.buffer.row - self.top
+    if self.caretVisible and caretScreenRow >= 0 and caretScreenRow < rows then
+        local x = codeX - self.horizontal + caretPixel
+        local y = EDITOR_CONTENT_TOP_INSET + caretScreenRow * lineHeight
+        if x > gutterWidth and x < self.width then
+            gc:setColorRGB(theme.cursor)
+            gc:drawLine(x, y + EDITOR_CARET_TOP_INSET, x,
+                y + lineHeight - EDITOR_CARET_BOTTOM_INSET)
+        end
+    end
+
+    if self.buffer:lineCount() > rows then
+        local trackHeight = contentHeight - 2
+        local thumbHeight = math.max(10, math.floor(trackHeight * rows / self.buffer:lineCount()))
+        local maximumTop = self.buffer:lineCount() - rows
+        local thumbY = 1 + math.floor((trackHeight - thumbHeight) * (self.top - 1) / maximumTop)
+        gc:setColorRGB(theme.border)
+        gc:fillRect(self.width - 4, 0, 4, contentHeight)
+        gc:setColorRGB(theme.muted)
+        gc:fillRect(self.width - 3, thumbY, 2, thumbHeight)
+    end
+
+    local statusY = self.height - STATUS_HEIGHT
+    gc:setColorRGB(theme.status)
+    gc:fillRect(0, statusY, self.width, STATUS_HEIGHT)
+    gc:setColorRGB(theme.border)
+    gc:drawLine(0, statusY, self.width, statusY)
+    gc:setFont(self.settings.font, "r", STATUS_FONT_SIZE)
+    local baseline = self.height - STATUS_BOTTOM_PADDING
+    if self.prompt then
+        gc:setColorRGB(theme.accent)
+        gc:fillRect(0, statusY, 3, STATUS_HEIGHT)
+        gc:setColorRGB(theme.statusText)
+        local promptText
+        if self.prompt.kind == "choice" then
+            local choices = {}
+            for index, choice in ipairs(self.prompt.choices) do
+                local label = type(choice) == "table" and choice.label or tostring(choice)
+                choices[#choices + 1] = index == self.prompt.selected and
+                    ("[" .. label .. "]") or label
+            end
+            promptText = self.prompt.label .. "  " .. table.concat(choices, "  ")
+        else
+            promptText = self.prompt.label .. "  " .. self.prompt.text .. "_"
+        end
+        gc:drawString(fitText(gc, promptText, self.width - 12), 7, baseline, "bottom")
+    else
+        local position = tostring(self.buffer.row) .. ":" .. tostring(self.buffer.col)
+        local positionWidth = gc:getStringWidth(position)
+        local file = (self.dirty and "* " or "") .. (self.fileName or "未命名")
+        local fileText = fitText(gc, file, math.floor(self.width * 0.3))
+        local fileWidth = gc:getStringWidth(fileText)
+        gc:setColorRGB(self.dirty and theme.accent or theme.statusText)
+        gc:drawString(fileText, 6, baseline, "bottom")
+        gc:setColorRGB(theme.statusMuted)
+        gc:drawString(position, self.width - positionWidth - 7, baseline, "bottom")
+        local messageLeft = fileWidth + 16
+        local messageWidth = self.width - messageLeft - positionWidth - 18
+        if self.status ~= "" and messageWidth > 12 then
+            gc:setColorRGB(self.statusIsError and theme.error or theme.statusMuted)
+            gc:drawString(fitText(gc, self.status, messageWidth),
+                messageLeft, baseline, "bottom")
+        end
+    end
+end
+
+nMoon = {
+    name = APP_NAME,
+    version = APP_VERSION,
+    Buffer = Buffer,
+    Storage = Storage,
+    app = App,
+    replaceAllLiteral = replaceAllLiteral
+}
+
+on = on or {}
+
+function on.construction()
+    App.destroyed = false
+    App.hostActive = true
+    Storage.recoverTransactions()
+    App:setupInput()
+    if timer and timer.start then timer.start(INPUT_POLL_SECONDS) end
+    App:registerMenu()
+    App:setStatus("欢迎使用 nMoon")
+end
+
+function on.resize(width, height)
+    App.width = width
+    App.height = height
+    if App.input and App.input.move then App.input:move(width + 1, height + 1) end
+    if App.help and App.helpLayout then
+        App.helpLayout.contentBottom = math.max(0, height - STATUS_HEIGHT)
+        App.helpLayout.visibleRows = math.max(0, math.floor(
+            (App.helpLayout.contentBottom - App.helpLayout.contentTop) /
+            App.settings.lineHeight))
+        App.helpTop = clamp(App.helpTop, 1, App:helpMaximumTop())
+    end
+    App:ensureCaretVisible()
+    if App.running then App:callRunner("resize", width, height) end
+    invalidate()
+end
+
+function on.paint(gc, x, y, width, height)
+    if App.consoleVisible and #App.consoleLines > 0 then
+        App:drawConsole(gc)
+        return
+    end
+    if App.running and type(App:runnerHandler("paint")) == "function" then
+        if App:callRunner("paint", gc, x, y, width, height) then return end
+        if App.consoleVisible and #App.consoleLines > 0 then
+            App:drawConsole(gc)
+            return
+        end
+    end
+    App:drawEditor(gc)
+end
+
+function on.timer()
+    if App.running then
+        if App.runHostActive then App:callRunner("timer") end
+    elseif App.hostActive and not App.destroyed then
+        App:pollInputNavigation()
+        App:advanceCaretBlink()
+    end
+end
+
+function on.charIn(text)
+    App:handleTextInput(text)
+end
+
+function on.backspaceKey()
+    if App.running then
+        App:callRunner("backspaceKey")
+    elseif App.prompt then
+        if App.prompt.kind == "input" then
+            App.prompt.text = unicodeSub(App.prompt.text, 1,
+                unicodeLength(App.prompt.text) - 1)
+            invalidate()
+        end
+    elseif not App.help and not App.fileBrowser then
+        if App.settings.smartEdit then App.buffer:backspaceSmart()
+        else App.buffer:backspace() end
+    end
+end
+
+function on.deleteKey()
+    if App.running then
+        App:callRunner("deleteKey")
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App.buffer:deleteForward()
+    end
+end
+
+function on.ctrlBackspaceKey()
+    if App.running then App:callRunner("backspaceKey")
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App:deleteWord(-1)
+    end
+end
+
+function on.ctrlDeleteKey()
+    if App.running then App:callRunner("deleteKey")
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App:deleteWord(1)
+    end
+end
+
+function on.clearKey()
+    if App.consoleVisible then
+        App:clearConsole()
+    elseif App.running then
+        App:callRunner("clearKey")
+    elseif App.prompt then
+        if App.prompt.kind == "input" then App.prompt.text = "" end
+        invalidate()
+    elseif not App.help and not App.fileBrowser then
+        App.buffer:deleteLine()
+    end
+end
+
+function on.enterKey()
+    if App.running then
+        App:callRunner("enterKey")
+    elseif App.prompt then
+        App:acceptPrompt()
+    elseif App.fileBrowser then
+        App:openSelectedFile()
+    elseif not App.help then
+        App.buffer:newline(App.settings.indentWidth, App.settings.smartEdit)
+    end
+end
+
+function on.returnKey()
+    if App.running then
+        App:callRunner("returnKey")
+    else
+        on.enterKey()
+    end
+end
+
+function on.tabKey()
+    if App.running then
+        if App:callRunner("tabKey") and App.running then App:toggleConsole() end
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App:changeIndent(false)
+    end
+end
+
+function on.backTabKey()
+    if App.running then
+        App:callRunner("backTabKey")
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App:changeIndent(true)
+    end
+end
+
+function on.backtabKey()
+    return on.backTabKey()
+end
+
+local function arrowRequest(direction, modifier)
+    local shifted = modifier == true or modifier == "shift" or modifier == "Shift"
+    local controlled = modifier == "ctrl" or modifier == "control" or modifier == "Ctrl"
+    if type(modifier) == "table" then
+        shifted = modifier.shift == true or modifier.shiftKey == true
+        controlled = modifier.ctrl == true or modifier.control == true or
+            modifier.ctrlKey == true or modifier.controlKey == true
+    end
+    local normalized = string.lower(tostring(direction or ""))
+    if string.find(normalized, "shift", 1, true) then shifted = true end
+    if string.find(normalized, "ctrl", 1, true) or
+        string.find(normalized, "control", 1, true) then controlled = true end
+    normalized = normalized:gsub("shift", ""):gsub("control", ""):gsub("ctrl", "")
+        :gsub("[+_%- ]", "")
+    return normalized, shifted, controlled
+end
+
+function on.arrowKey(direction, modifier)
+    local controlled
+    direction, modifier, controlled = arrowRequest(direction, modifier)
+    if App.consoleVisible then
+        local rows = math.max(1, math.floor((App.height - STATUS_HEIGHT) /
+            App.settings.lineHeight))
+        local maximum = math.max(1, #App.consoleLines - rows + 1)
+        if direction == "up" then
+            App.consoleTop = math.max(1, App.consoleTop - 1)
+        elseif direction == "down" then
+            App.consoleTop = math.min(maximum, App.consoleTop + 1)
+        end
+        invalidate()
+        return
+    end
+    if App.running then
+        App:callRunner("arrowKey", direction)
+        return
+    end
+    if App.prompt then
+        if App.prompt.kind == "choice" then
+            if direction == "left" or direction == "up" then
+                App:promptChoice(-1)
+            elseif direction == "right" or direction == "down" then
+                App:promptChoice(1)
+            end
+        end
+        return
+    end
+    if App.fileBrowser then
+        if direction == "up" then
+            App.fileBrowser.index = math.max(1, App.fileBrowser.index - 1)
+        elseif direction == "down" then
+            App.fileBrowser.index = math.min(#App.fileBrowser.items,
+                App.fileBrowser.index + 1)
+        elseif direction == "left" then
+            App.fileBrowser.index = math.max(1,
+                App.fileBrowser.index - App:overlayVisibleRows())
+        elseif direction == "right" then
+            App.fileBrowser.index = math.min(#App.fileBrowser.items,
+                App.fileBrowser.index + App:overlayVisibleRows())
+        end
+        invalidate()
+        return
+    end
+    if App.help then
+        if direction == "up" then
+            App:scrollHelp(-1)
+        elseif direction == "down" then
+            App:scrollHelp(1)
+        end
+        return
+    end
+    local extending = modifier or App.shiftHeld or App.selectionLatched
+    if controlled and (direction == "left" or direction == "right") then
+        App:moveWord(direction == "left" and -1 or 1, extending)
+    elseif direction == "left" then
+        App.buffer:moveHorizontal(-1, extending)
+    elseif direction == "right" then
+        App.buffer:moveHorizontal(1, extending)
+    elseif direction == "up" then
+        App.buffer:moveVertical(-1, extending)
+    elseif direction == "down" then
+        App.buffer:moveVertical(1, extending)
+    end
+    App.mergeBlocked = true
+    App.status = ""
+    App.statusIsError = false
+    App:wakeCaret()
+    App:ensureCaretVisible()
+    invalidate()
+end
+
+function on.homeKey(modifier)
+    local _, shifted = arrowRequest("", modifier)
+    if App.running then App:callRunner("homeKey")
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App:moveHome(shifted or App.shiftHeld or App.selectionLatched)
+    end
+end
+
+function on.endKey(modifier)
+    local _, shifted = arrowRequest("", modifier)
+    if App.running then App:callRunner("endKey")
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App:moveEnd(shifted or App.shiftHeld or App.selectionLatched)
+    end
+end
+
+function on.pageUpKey(modifier)
+    local _, shifted = arrowRequest("", modifier)
+    if App.running then App:callRunner("pageUpKey")
+    elseif App.help then App:scrollHelp(-App:helpPageRows())
+    elseif not App.prompt and not App.fileBrowser then
+        App:movePage(-1, shifted or App.shiftHeld or App.selectionLatched)
+    end
+end
+
+function on.pageDownKey(modifier)
+    local _, shifted = arrowRequest("", modifier)
+    if App.running then App:callRunner("pageDownKey")
+    elseif App.help then App:scrollHelp(App:helpPageRows())
+    elseif not App.prompt and not App.fileBrowser then
+        App:movePage(1, shifted or App.shiftHeld or App.selectionLatched)
+    end
+end
+
+function on.shiftKey(pressed)
+    if pressed == nil then
+        App.shiftHeld = not App.shiftHeld
+    else
+        App.shiftHeld = pressed == true or pressed == "down"
+    end
+end
+
+function on.shiftArrowKey(direction)
+    on.arrowKey(direction, true)
+end
+
+function on.shiftArrowLeft() on.arrowKey("left", true) end
+function on.shiftArrowRight() on.arrowKey("right", true) end
+function on.shiftArrowUp() on.arrowKey("up", true) end
+function on.shiftArrowDown() on.arrowKey("down", true) end
+
+function on.grabDown()
+    if App.running then
+        App:callRunner("grabDown")
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App.buffer:toggleSelection()
+        App.selectionLatched = App.buffer.anchor ~= nil
+        App:setStatus(App.selectionLatched and "已开始选择" or "已结束选择")
+    end
+end
+
+function on.copy()
+    if App.consoleVisible then
+        App:copyConsole()
+    elseif App.running then
+        App:callRunner("copy")
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App:copy()
+    end
+end
+
+function on.cut()
+    if App.running then
+        App:callRunner("cut")
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App:cut()
+    end
+end
+
+function on.paste()
+    if App.running then
+        App:callRunner("paste")
+    elseif App.prompt and App.prompt.kind == "input" then
+        local text = clipboard.getText()
+        if text then App:handleTextInput(text) end
+    elseif not App.prompt and not App.help and not App.fileBrowser then
+        App:paste()
+    end
+end
+
+function on.findNext()
+    if not App.running and not App.prompt and not App.help and not App.fileBrowser then
+        App:findNext()
+    end
+end
+
+function on.findPrevious()
+    if not App.running and not App.prompt and not App.help and not App.fileBrowser then
+        App:findPrevious()
+    end
+end
+
+function on.escapeKey()
+    if App.running then
+        App:stopRun()
+    elseif App.consoleVisible then
+        App.consoleVisible = false
+        App:setStatus("已关闭运行输出")
+    elseif not App:cancelOverlay() then
+        App.buffer:clearSelection()
+        App.selectionLatched = false
+        App:setStatus("已取消选择")
+    end
+end
+
+function on.contextMenu()
+    if not App.running and not App.help and not App.prompt and not App.fileBrowser then
+        App:ask("查找", App.lastFind or "",
+            function(value) App:findLiteral(value, true) end)
+    end
+end
+
+function on.mouseWheel(delta)
+    if App.running then
+        App:callRunner("mouseWheel", delta)
+        return
+    end
+    if not App.help then return end
+    local name = string.lower(tostring(delta or ""))
+    if name == "up" then
+        App:scrollHelp(-1)
+    elseif name == "down" then
+        App:scrollHelp(1)
+    else
+        local amount = tonumber(delta) or 0
+        if amount > 0 then
+            App:scrollHelp(-1)
+        elseif amount < 0 then
+            App:scrollHelp(1)
+        end
+    end
+end
+
+local function scrollFromMouse(y)
+    local rows = App:visibleRows()
+    local maximum = math.max(1, App.buffer:lineCount() - rows + 1)
+    local ratio = clamp(y / math.max(1, App.height - STATUS_HEIGHT), 0, 1)
+    App.top = clamp(math.floor(ratio * (maximum - 1)) + 1, 1, maximum)
+end
+
+function on.mouseDown(x, y)
+    if App.running then
+        App:callRunner("mouseDown", x, y)
+        return
+    end
+    if App.prompt or App.help then return end
+    if App.fileBrowser then
+        if y < App.height - STATUS_HEIGHT then
+            local index = App.fileBrowser.top +
+                math.floor(y / App.settings.lineHeight)
+            App.fileBrowser.index = clamp(index, 1, #App.fileBrowser.items)
+            invalidate()
+        end
+        return
+    end
+    App:wakeCaret()
+    local rows = App:visibleRows()
+    if x >= App.width - 6 and App.buffer:lineCount() > rows then
+        App.mouseDrag = { kind = "scroll", active = true }
+        scrollFromMouse(y)
+    elseif y < App.height - STATUS_HEIGHT then
+        local row = App:editorRowAtY(y)
+        App.mouseDrag = {
+            kind = "text", active = true,
+            originX = x, originRow = row, x = x, row = row
+        }
+    end
+    invalidate()
+end
+
+function on.mouseMove(x, y)
+    if App.running then
+        App:callRunner("mouseMove", x, y)
+        return
+    end
+    local drag = App.mouseDrag
+    if not drag or not drag.active then return end
+    if drag.kind == "scroll" then
+        scrollFromMouse(y)
+    else
+        local contentHeight = App.height - STATUS_HEIGHT
+        if y < 0 then
+            App.top = math.max(1, App.top - 1)
+        elseif y >= contentHeight then
+            App.top = math.min(math.max(1,
+                App.buffer:lineCount() - App:visibleRows() + 1), App.top + 1)
+        end
+        drag.x = x
+        drag.row = App:editorRowAtY(y)
+    end
+    invalidate()
+end
+
+function on.mouseUp(x, y)
+    if App.running then
+        App:callRunner("mouseUp", x, y)
+        return
+    end
+    local drag = App.mouseDrag
+    if not drag then return end
+    if drag.kind == "scroll" then
+        scrollFromMouse(y)
+        App.mouseDrag = nil
+    else
+        drag.x = x
+        drag.row = App:editorRowAtY(y)
+        drag.active = false
+    end
+    App.mergeBlocked = true
+    invalidate()
+end
+
+function on.getFocus()
+    if App.running then
+        App:callRunner("getFocus")
+    else
+        App:wakeCaret()
+        if App.input and App.input.setFocus then App.input:setFocus(true) end
+        invalidate()
+    end
+end
+
+function on.loseFocus()
+    if App.running then
+        App:callRunner("loseFocus")
+    else
+        App.caretVisible = false
+        invalidate()
+    end
+end
+
+function on.activate()
+    if App.destroyed then return end
+    App.hostActive = true
+    if App.running then
+        if not App.runHostActive then
+            if App:callRunner("activate") and App.running then
+                App.runHostActive = true
+                if App.userTimerActive and App.userTimerInterval and
+                    timer and timer.start then
+                    timer.start(App.userTimerInterval)
+                end
+            end
+        end
+    else
+        if App.input and App.input.setVisible then App.input:setVisible(true) end
+        if App.input and App.input.setFocus then App.input:setFocus(true) end
+        if timer and timer.start then timer.start(INPUT_POLL_SECONDS) end
+        App:wakeCaret()
+        invalidate()
+    end
+end
+
+function on.deactivate()
+    App.hostActive = false
+    if timer and timer.stop then timer.stop() end
+    if App.running then
+        if App.runHostActive then
+            App.runHostActive = false
+            App:callRunner("deactivate")
+        end
+    else
+        App.caretVisible = false
+    end
+end
+
+function on.destroy()
+    App.destroyed = true
+    App.hostActive = false
+    if timer and timer.stop then timer.stop() end
+    if App.running or App.runEnvironment then App:destroyRun() end
+    if App.input and App.input.registerFilter then
+        App.input:registerFilter(nil)
+    end
+    if App.input and App.input.setVisible then App.input:setVisible(false) end
+end
+
+local function makeRunnerForwarder(name)
+    return function(...)
+        if App.running then return App:callRunner(name, ...) end
+        if name == "help" then App:showHelp() end
+    end
+end
+
+local runnerForwardEvents = {
+    "arrowDown", "arrowLeft", "arrowRight", "arrowUp",
+    "createMathBox", "grabUp", "help", "keyboardDown", "keyboardUp",
+    "propertiesChanged", "rightMouseDown", "rightMouseUp", "varchange"
+}
+for _, eventName in ipairs(runnerForwardEvents) do
+    on[eventName] = makeRunnerForwarder(eventName)
+end
+
+function on.save()
+    return {
+        format = 1,
+        text = App.buffer:text(),
+        fileName = App.fileName,
+        dirty = App.dirty,
+        row = App.buffer.row,
+        col = App.buffer.col,
+        recentFiles = App.recentFiles,
+        lastFind = App.lastFind,
+        settings = {
+            font = App.settings.font,
+            fontMode = App.settings.fontMode,
+            fontSize = App.settings.fontSize,
+            lineHeight = App.settings.lineHeight,
+            indentWidth = App.settings.indentWidth,
+            theme = App.settings.theme,
+            smartEdit = App.settings.smartEdit
+        },
+        top = App.top,
+        horizontal = App.horizontal
+    }
+end
+
+function on.getSymbolList()
+    local symbols, seen = {}, {}
+    local function add(name)
+        if seen[name] or not Storage.isUserTextName(name) then return end
+        local value = Storage.load(name)
+        if type(value) ~= "string" then return end
+        seen[name] = true
+        symbols[#symbols + 1] = name
+    end
+    add(App.fileName)
+    for _, name in ipairs(App.recentFiles or {}) do add(name) end
+    return symbols
+end
+
+function on.restore(state)
+    if type(state) ~= "table" or state.format ~= 1 then return end
+    local text = type(state.text) == "string" and state.text or ""
+    App.buffer:setText(text)
+    App.fileName = type(state.fileName) == "string" and state.fileName or nil
+    if type(state.settings) == "table" then
+        App.settings.font = state.settings.font or App.settings.font
+        App.settings.fontMode = state.settings.fontMode or App.settings.fontMode
+        local restoredSize = tonumber(state.settings.fontSize)
+        local supportedSizes = {
+            [7] = true, [9] = true, [10] = true,
+            [11] = true, [12] = true, [24] = true
+        }
+        App.settings.fontSize = supportedSizes[restoredSize] and
+            restoredSize or 9
+        App.settings.lineHeight = App.settings.fontSize + 6
+        App.settings.indentWidth = tonumber(state.settings.indentWidth) or App.settings.indentWidth
+        App.settings.theme = clamp(tonumber(state.settings.theme) or 1, 1, #themes)
+        if type(state.settings.smartEdit) == "boolean" then
+            App.settings.smartEdit = state.settings.smartEdit
+        end
+    end
+    if type(state.recentFiles) == "table" then
+        local restored, seen = {}, {}
+        for _, name in ipairs(state.recentFiles) do
+            if Storage.isUserTextName(name) and not seen[name] and
+                #restored < MAX_RECENT_FILES then
+                seen[name] = true
+                restored[#restored + 1] = name
+            end
+        end
+        App.recentFiles = restored
+    end
+    App.lastFind = type(state.lastFind) == "string" and state.lastFind or nil
+    App.top = tonumber(state.top) or 1
+    App.horizontal = tonumber(state.horizontal) or 0
+    App:resetHistory()
+    local stored = App.fileName and Storage.load(App.fileName) or ""
+    App.savedText = type(stored) == "string" and stored or ""
+    local restoredDirty = state.dirty == true or
+        (App.fileName and stored ~= text) or (not App.fileName and text ~= "")
+    if restoredDirty then
+        App.savedRevision = App.currentRevision - 1
+        App:updateDirty()
+    end
+    App.buffer:setCaret(tonumber(state.row) or 1, tonumber(state.col) or 0, false)
+    App:ensureCaretVisible()
+end

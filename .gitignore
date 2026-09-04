@@ -1,0 +1,27 @@
+# Lua/Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and temporary runners
+*.log
+*.tmp
+*.temp
+*~
+.nMoon-test-runner.*
+nMoon-test-runner.*
+
+# tnstools extraction/verification output
+*.tns.xml/
+_artifacts/
+*.tixc
+verify/
+verify-*/
+*_verify/
+
+# Keep release and reproducible build inputs tracked
+!nMoon.tns
+!build/nMoon.xml/
+!build/nMoon.xml/**
