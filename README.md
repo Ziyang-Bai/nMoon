@@ -4,7 +4,7 @@ nMoon 是面向 TI-Nspire 的中文 Lua 编辑器。它在计算器文档中提�
 
 ## 使用
 
-将发布产物 `nMoon.tns` 传输到 TI-Nspire 并打开。当前脚本声明 TI-Nspire Lua API 2.7。
+按照下方“构建”说明从源码生成 `dist/nMoon.tns`，再将其传输到 TI-Nspire 并打开。当前脚本声明 TI-Nspire Lua API 2.7。
 
 应用内“帮助”菜单列出了按键和组合键；常用组合键包括：
 
@@ -21,7 +21,7 @@ nMoon 是面向 TI-Nspire 的中文 Lua 编辑器。它在计算器文档中提�
 - `tests/nMoon_core_test.lua`：编辑器核心行为测试
 - `tests/nMoon_app_test.lua`：文件、界面与代码预览行为测试
 - `build/nMoon.xml/`：用于生成 TI-Nspire 文档的 XML 输入
-- `nMoon.tns`：可直接传输的发布产物
+- `build.py`：从源码生成并校验 TI-Nspire 文档的跨平台构建入口
 
 ## 测试
 
@@ -36,13 +36,41 @@ lua -e "dofile('tests/ti_api_mock.lua'); dofile('src/nMoon.lua'); dofile('tests/
 
 ## 构建
 
-构建依赖支持 TI-Nspire method 13 的 `tnstools.py`；该工具不包含在本仓库中。使用仓库内已同步好的 XML 输入生成并回读校验产物：
+构建以 `src/nMoon.lua` 为唯一源码，并依赖支持 TI-Nspire method 13 的
+[TnsTools](https://github.com/MaksimirKurtov/TnsTools)。先获取完整的 TnsTools
+目录并按其说明安装依赖；`tnstools.py` 同目录下的模块也必须保留。
 
-```sh
-python path/to/tnstools.py -xml build/nMoon.xml -out nMoon.tns --verify
+Windows PowerShell 示例：
+
+```powershell
+git clone https://github.com/MaksimirKurtov/TnsTools.git ..\TnsTools
+py -m pip install -r ..\TnsTools\requirements.txt
+py .\build.py --tnstools ..\TnsTools\tnstools.py
 ```
 
-`--verify` 会解包新生成的文档并逐字节核对 XML。发布前还应确认 `build/nMoon.xml/Problem1.xml` 中的脚本与 `src/nMoon.lua` 一致。
+通用 shell 示例：
+
+```sh
+git clone https://github.com/MaksimirKurtov/TnsTools.git ../TnsTools
+python3 -m pip install -r ../TnsTools/requirements.txt
+python3 build.py --tnstools ../TnsTools/tnstools.py
+```
+
+也可通过环境变量提供工具路径：
+
+```powershell
+$env:TNS_TOOLS = 'C:\path\to\TnsTools\tnstools.py'
+py .\build.py
+```
+
+```sh
+TNS_TOOLS=/path/to/TnsTools/tnstools.py python3 build.py
+```
+
+默认输出为 `dist/nMoon.tns`；可用 `--output PATH` 指定其他位置。构建脚本会将
+`build/nMoon.xml/` 复制到系统临时目录，把正确 XML 转义后的 `src/nMoon.lua`
+写入临时 `Problem1.xml`，调用 TnsTools 构建并执行 `--verify`，成功后才原子替换
+目标文件。`.tns` 编译产物不纳入版本控制，需要时请在本地重新构建。
 
 ## 许可证
 

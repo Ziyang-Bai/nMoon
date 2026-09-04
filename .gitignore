@@ -13,15 +13,13 @@ __pycache__/
 .nMoon-test-runner.*
 nMoon-test-runner.*
 
-# tnstools extraction/verification output
+# Build outputs and tnstools extraction/verification artifacts
+*.tns
+dist/
 *.tns.xml/
+*.tns.verify.xml/
 _artifacts/
 *.tixc
 verify/
 verify-*/
 *_verify/
-
-# Keep release and reproducible build inputs tracked
-!nMoon.tns
-!build/nMoon.xml/
-!build/nMoon.xml/**
