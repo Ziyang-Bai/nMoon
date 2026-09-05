@@ -1,46 +1,34 @@
 # nMoon
 
-nMoon 是面向 TI-Nspire 的中文 Lua 编辑器。它在计算器文档中提供文本编辑、变量文件管理、查找与替换、语法高亮、撤销与重做，以及带指令预算保护的 Lua 代码预览和运行输出。
+nMoon Alpha 是运行在 TI-Nspire 上的中文 Lua 编辑器。它可以编辑和保存代码、管理文本变量、查找与替换、显示语法高亮、撤销与重做，还能直接预览 Lua 程序。
 
-## 使用
+## 功能
 
-按照下方“构建”说明从源码生成 `dist/nMoon.tns`，再将其传输到 TI-Nspire 并打开。当前脚本声明 TI-Nspire Lua API 2.7。
+- 编辑 TI-Nspire 文本变量，新建、打开、保存、重命名和删除文件
+- 查找上一处或下一处匹配，循环查找并替换当前选择或全部匹配
+- 高亮 Lua 语法，检查语法错误
+- 撤销和重做编辑
+- 运行当前代码，在图形预览和输出控制台之间切换
+- 用指令预算中断可能陷入死循环的预览代码
 
-应用内“帮助”菜单列出了按键和组合键；常用组合键包括：
+## 开始使用
+
+仓库保存源码和构建配置；`build.py` 把成品写入 `dist/`。完成下方构建后，将 `dist/nMoon.tns` 传到 TI-Nspire 并打开。nMoon 使用 TI-Nspire Lua API 2.7。
+
+应用内的“帮助”菜单列出了按键和组合键。常用组合键：
 
 - `Ctrl+N` / `Ctrl+O` / `Ctrl+S`：新建、打开、保存
 - `Ctrl+F`：查找
 - `Ctrl+Z` / `Ctrl+Y`：撤销、重做
 - `Ctrl+R`：运行当前代码
-- `Esc`：取消当前操作或退出预览
+- `Tab`：在图形预览和输出控制台之间切换
+- `Esc`：取消操作或退出预览
 
-## 项目结构
+## 从源码构建
 
-- `src/nMoon.lua`：应用源代码
-- `tests/ti_api_mock.lua`：桌面 Lua 测试所用的 TI API 替身
-- `tests/nMoon_core_test.lua`：编辑器核心行为测试
-- `tests/nMoon_app_test.lua`：文件、界面与代码预览行为测试
-- `build/nMoon.xml/`：用于生成 TI-Nspire 文档的 XML 输入
-- `build.py`：从源码生成并校验 TI-Nspire 文档的跨平台构建入口
+构建会调用 [TnsTools](https://github.com/MaksimirKurtov/TnsTools)。克隆完整的 TnsTools 目录，再安装其中列出的 Python 包。
 
-## 测试
-
-需要可用的 Lua 运行时及 `debug` 库。两组测试应分别在全新的 Lua 进程中运行：
-
-```sh
-lua -e "dofile('tests/ti_api_mock.lua'); dofile('src/nMoon.lua'); dofile('tests/nMoon_core_test.lua')"
-lua -e "dofile('tests/ti_api_mock.lua'); dofile('src/nMoon.lua'); dofile('tests/nMoon_app_test.lua')"
-```
-
-成功时分别输出 `nMoon core tests: OK` 和 `nMoon app tests: OK`。
-
-## 构建
-
-构建以 `src/nMoon.lua` 为唯一源码，并依赖支持 TI-Nspire method 13 的
-[TnsTools](https://github.com/MaksimirKurtov/TnsTools)。先获取完整的 TnsTools
-目录并按其说明安装依赖；`tnstools.py` 同目录下的模块也必须保留。
-
-Windows PowerShell 示例：
+Windows PowerShell：
 
 ```powershell
 git clone https://github.com/MaksimirKurtov/TnsTools.git ..\TnsTools
@@ -48,7 +36,7 @@ py -m pip install -r ..\TnsTools\requirements.txt
 py .\build.py --tnstools ..\TnsTools\tnstools.py
 ```
 
-通用 shell 示例：
+通用 shell：
 
 ```sh
 git clone https://github.com/MaksimirKurtov/TnsTools.git ../TnsTools
@@ -56,7 +44,7 @@ python3 -m pip install -r ../TnsTools/requirements.txt
 python3 build.py --tnstools ../TnsTools/tnstools.py
 ```
 
-也可通过环境变量提供工具路径：
+`--tnstools PATH` 指定 `tnstools.py`。也可以设置 `TNS_TOOLS`：
 
 ```powershell
 $env:TNS_TOOLS = 'C:\path\to\TnsTools\tnstools.py'
@@ -67,11 +55,28 @@ py .\build.py
 TNS_TOOLS=/path/to/TnsTools/tnstools.py python3 build.py
 ```
 
-默认输出为 `dist/nMoon.tns`；可用 `--output PATH` 指定其他位置。构建脚本会将
-`build/nMoon.xml/` 复制到系统临时目录，把正确 XML 转义后的 `src/nMoon.lua`
-写入临时 `Problem1.xml`，调用 TnsTools 构建并执行 `--verify`，成功后才原子替换
-目标文件。`.tns` 编译产物不纳入版本控制，需要时请在本地重新构建。
+默认成品是 `dist/nMoon.tns`。`--output PATH` 可以改写输出位置。构建时，`build.py` 将 `src/nMoon.lua` 写入 `build/nMoon.xml` 的副本，调用 TnsTools 生成并校验文档，再写入目标文件。
+
+## 测试
+
+测试需要带 `debug` 库的 Lua 运行时。分别启动全新的 Lua 进程：
+
+```sh
+lua -e "dofile('tests/ti_api_mock.lua'); dofile('src/nMoon.lua'); dofile('tests/nMoon_core_test.lua')"
+lua -e "dofile('tests/ti_api_mock.lua'); dofile('src/nMoon.lua'); dofile('tests/nMoon_app_test.lua')"
+```
+
+两条命令会分别输出 `nMoon core tests: OK` 和 `nMoon app tests: OK`。
+
+## 目录
+
+- `src/nMoon.lua`：编辑器源码
+- `build/nMoon.xml/`：TI-Nspire 文档构建配置
+- `build.py`：构建入口
+- `tests/ti_api_mock.lua`：桌面测试使用的 TI API 实现
+- `tests/nMoon_core_test.lua`：编辑器核心测试
+- `tests/nMoon_app_test.lua`：文件、界面和代码预览测试
 
 ## 许可证
 
-本项目仅按 GNU General Public License version 3 发布，SPDX 许可证标识为 **GPL-3.0-only**。完整条款见 [LICENSE](LICENSE)。
+nMoon 使用 [GNU General Public License v3.0](LICENSE)，SPDX 标识为 `GPL-3.0-only`。
