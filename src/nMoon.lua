@@ -2107,7 +2107,6 @@ end
 
 local RUN_BUDGET_MESSAGE = "运行已中断：超过指令预算（可能存在死循环）"
 local RUN_BUDGET_SENTINEL = {}
-local SAFE_PREVIEW_ERROR = "当前 TI 环境不支持安全预览"
 local RUN_TOP_BUDGET = 600000
 local RUN_EVENT_BUDGET = 240000
 local RUN_HOOK_STEP = 1000
@@ -2125,13 +2124,9 @@ local function runError(message)
     return "运行错误：" .. tostring(message or "未知错误")
 end
 
-function App:safePreviewSupported()
-    return type(debug) == "table" and type(debug.sethook) == "function"
-end
-
 function App:attachRunHook(thread)
-    if not self.activeRunHook or not self:safePreviewSupported() or
-        not self.activeHookRecords then return false end
+    if not self.activeRunHook or not self.activeHookRecords or
+        type(debug) ~= "table" or type(debug.sethook) ~= "function" then return false end
     if self.activeHookRecords[thread] then return true end
     local previous, mask, count
     if type(debug.gethook) == "function" then
@@ -2149,26 +2144,30 @@ function App:attachRunHook(thread)
 end
 
 function App:protectedCall(fn, budget, ...)
-    if not self:safePreviewSupported() then return false, SAFE_PREVIEW_ERROR end
     local arguments = packValues(...)
-    local remaining = budget or RUN_EVENT_BUDGET
-    local oldHook, oldMask, oldCount
-    if type(debug.gethook) == "function" then
-        local got, previous, mask, count = nativePcall(debug.gethook)
-        if got then oldHook, oldMask, oldCount = previous, mask, count end
+    local hookApi = type(debug) == "table" and debug
+    local setHook = hookApi and hookApi.sethook
+    local oldHook, oldMask, oldCount, installed
+    if type(setHook) == "function" then
+        if type(hookApi.gethook) == "function" then
+            local got, previous, mask, count = nativePcall(hookApi.gethook)
+            if got then oldHook, oldMask, oldCount = previous, mask, count end
+        end
+        local remaining = budget or RUN_EVENT_BUDGET
+        local hook = function()
+            remaining = remaining - RUN_HOOK_STEP
+            if remaining <= 0 then nativeError(RUN_BUDGET_SENTINEL, 0) end
+        end
+        installed = nativePcall(setHook, hook, "", RUN_HOOK_STEP)
+        if installed then
+            self.activeRunHook = hook
+            self.activeHookRecords = {}
+        end
     end
-    local hook = function()
-        remaining = remaining - RUN_HOOK_STEP
-        if remaining <= 0 then nativeError(RUN_BUDGET_SENTINEL, 0) end
-    end
-    local installed = nativePcall(debug.sethook, hook, "", RUN_HOOK_STEP)
-    if not installed then return false, SAFE_PREVIEW_ERROR end
-    self.activeRunHook = hook
-    self.activeHookRecords = {}
     local function trace(message)
         if message == RUN_BUDGET_SENTINEL then return message end
-        if type(debug.traceback) == "function" then
-            local ok, traceback = nativePcall(debug.traceback,
+        if hookApi and type(hookApi.traceback) == "function" then
+            local ok, traceback = nativePcall(hookApi.traceback,
                 tostring(message), 2)
             if ok then return traceback end
         end
@@ -2177,18 +2176,20 @@ function App:protectedCall(fn, budget, ...)
     local results = packValues(nativeXpcall(function()
         return fn(unpackValues(arguments, 1, arguments.n))
     end, trace))
-    self.activeRunHook = nil
-    nativePcall(debug.sethook)
-    for thread, previous in pairs(self.activeHookRecords) do
-        nativePcall(debug.sethook, thread)
-        if previous.hook then
-            nativePcall(debug.sethook, thread, previous.hook,
-                previous.mask, previous.count)
+    if installed then
+        self.activeRunHook = nil
+        nativePcall(setHook)
+        for thread, previous in pairs(self.activeHookRecords) do
+            nativePcall(setHook, thread)
+            if previous.hook then
+                nativePcall(setHook, thread, previous.hook,
+                    previous.mask, previous.count)
+            end
         end
-    end
-    self.activeHookRecords = nil
-    if oldHook then
-        nativePcall(debug.sethook, oldHook, oldMask, oldCount)
+        self.activeHookRecords = nil
+        if oldHook then
+            nativePcall(setHook, oldHook, oldMask, oldCount)
+        end
     end
     return unpackValues(results, 1, results.n)
 end
@@ -2280,7 +2281,7 @@ function App:createRunEnvironment()
     if type(_G.class) == "function" then environment.class = _G.class end
 
     environment.debug = {}
-    if debug then
+    if type(debug) == "table" then
         environment.debug.traceback = debug.traceback
         environment.debug.getinfo = debug.getinfo
     end
@@ -2289,15 +2290,11 @@ function App:createRunEnvironment()
         local coroutineProxy = safeCopyTable(coroutine)
         coroutineProxy.create = function(fn)
             local thread = nativeCoroutineCreate(fn)
-            if not App:attachRunHook(thread) then
-                nativeError("无法为协程启用指令预算", 2)
-            end
+            App:attachRunHook(thread)
             return thread
         end
         coroutineProxy.resume = function(thread, ...)
-            if not App:attachRunHook(thread) then
-                return false, "无法为协程启用指令预算"
-            end
+            App:attachRunHook(thread)
             local values = packValues(nativeCoroutineResume(thread, ...))
             if not values[1] and values[2] == RUN_BUDGET_SENTINEL then
                 nativeError(RUN_BUDGET_SENTINEL, 0)
@@ -2355,10 +2352,6 @@ function App:startRun()
         "@nMoon/" .. (self.fileName or "untitled"))
     if not chunk then
         self:setStatus("语法错误：" .. tostring(message), true)
-        return false
-    end
-    if not self:safePreviewSupported() then
-        self:setStatus(SAFE_PREVIEW_ERROR, true)
         return false
     end
     self:clearConsole()

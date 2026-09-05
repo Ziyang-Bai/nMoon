@@ -1043,17 +1043,6 @@ equal(nMoon.app.input.focused, true, "返回编辑器恢复输入焦点")
 equal(timer.running, true, "返回编辑器恢复输入轮询")
 
 
-local originalSetHook = debug and debug.sethook
-if debug then debug.sethook = nil end
-nMoon.app.buffer:setText("print(\"unsafe\")")
-local unsupportedRun = nMoon.app:startRun()
-local unsupportedStatus = nMoon.app.status
-if nMoon.app.running then nMoon.app:stopRun() end
-if debug then debug.sethook = originalSetHook end
-equal(unsupportedRun, false, "缺少debug.sethook时拒绝运行")
-contains(unsupportedStatus, "当前 TI 环境不支持安全预览", "缺少debug.sethook提示")
-
-
 local function assertBudgetCannotBeCaught(source, label)
     nMoon.app.buffer:setText(source)
     local started = nMoon.app:startRun()
@@ -1067,6 +1056,16 @@ end
 assertBudgetCannotBeCaught(
     "pcall(function() while true do end end)\nprint('pcall swallowed')",
     "用户pcall")
+
+assertBudgetCannotBeCaught(
+    "xpcall(function() for i = 1, 1000000 do end end, function() return 'caught' end)",
+    "用户xpcall")
+assertBudgetCannotBeCaught(
+    "pcall(function() coroutine.resume(coroutine.create(function() for i = 1, 1000000 do end end)) end)",
+    "用户coroutine.resume")
+assertBudgetCannotBeCaught(
+    "pcall(coroutine.wrap(function() for i = 1, 1000000 do end end))",
+    "用户coroutine.wrap")
 
 nMoon.app.buffer:setText("while true do end")
 equal(nMoon.app:startRun(), false, "顶层死循环被中断")
@@ -1153,6 +1152,112 @@ equal(hostLifecycle.events.destroy, 1, "宿主destroy转发一次")
 equal(nMoon.app.running, false, "宿主destroy销毁预览")
 equal(timer.running, false, "宿主destroy停止用户计时器")
 
+
+do
+    local hostDebug = debug
+    local function assertNativePreview(debugApi, label)
+        debug = debugApi
+        dofile("tests/ti_api_mock.lua")
+        on = {}
+        dofile("src/nMoon.lua")
+        on.construction()
+        local app = nMoon.app
+        app.fileName = "native_preview"
+        app.buffer:setText(
+            "local total = 0; for i = 1, 5 do total = total + i end\n" ..
+            "print('native preview ' .. total)\n" ..
+            "var.store('nativepreview', tostring(total))\n" ..
+            "events = { activate = 0, deactivate = 0, destroy = 0, timer = 0 }\n" ..
+            "co = coroutine.create(function(value)\n" ..
+            "  local nextValue = coroutine.yield(value + 1, nil, 'yielded')\n" ..
+            "  return nextValue * 2, nil, 'done'\n" ..
+            "end)\n" ..
+            "local ok, value, gap, state = coroutine.resume(co, 14)\n" ..
+            "assert(ok and value == 15 and gap == nil and state == 'yielded')\n" ..
+            "wrapped = coroutine.wrap(function() coroutine.yield('wrapped', nil, 7); return 'finished' end)\n" ..
+            "local text, gap, number = wrapped(); assert(text == 'wrapped' and gap == nil and number == 7)\n" ..
+            "function on.construction() timer.start(0.25) end\n" ..
+            "function on.activate() events.activate = events.activate + 1 end\n" ..
+            "function on.deactivate() events.deactivate = events.deactivate + 1 end\n" ..
+            "function on.destroy() events.destroy = events.destroy + 1 end\n" ..
+            "function on.paint(gc, x, y, width, height) paintArgs = { gc, x, y, width, height }; gc:drawString('native paint', x, y, 'top') end\n" ..
+            "function on.timer()\n" ..
+            "  local ok, value, gap, state = coroutine.resume(co, 9)\n" ..
+            "  assert(ok and value == 18 and gap == nil and state == 'done')\n" ..
+            "  clipboard.addText(wrapped() .. ':' .. value)\n" ..
+            "  events.timer = events.timer + 1\n" ..
+            "end")
+        equal(app:startRun(), true, label .. "启动原生预览")
+        local runner = app.runEnvironment
+        equal(app.consoleLines[1], "native preview 15", label .. "有限循环和print")
+        equal(variableStore.nativepreview, "15", label .. "var存储")
+        equal(app.consoleVisible, false, label .. "图形优先")
+        on.paint(gc, 11, 12, 13, 14)
+        equal(runner.paintArgs[1], gc, label .. "paint收到gc")
+        equal(runner.paintArgs[2], 11, label .. "paint收到x")
+        equal(runner.paintArgs[3], 12, label .. "paint收到y")
+        equal(runner.paintArgs[4], 13, label .. "paint收到width")
+        equal(runner.paintArgs[5], 14, label .. "paint收到height")
+        if not findDraw("native paint") then error(label .. "未绘制用户图形") end
+        equal(runner.events.activate, 1, label .. "启动activate")
+        equal(timer.interval, 0.25, label .. "construction启动timer")
+        on.deactivate()
+        equal(timer.running, false, label .. "deactivate暂停timer")
+        on.timer()
+        equal(runner.events.timer, 0, label .. "停用时不调用timer")
+        on.activate()
+        equal(runner.events.activate, 2, label .. "恢复activate")
+        equal(timer.running, true, label .. "activate恢复timer")
+        equal(timer.interval, 0.25, label .. "恢复计时间隔")
+        on.timer()
+        equal(runner.events.timer, 1, label .. "timer继续协程")
+        equal(clipboardText, "finished:18", label .. "协程返回值和clipboard")
+        on.escapeKey()
+        equal(runner.events.deactivate, 2, label .. "Esc调用deactivate")
+        equal(runner.events.destroy, 1, label .. "Esc调用destroy")
+        equal(app.running, false, label .. "Esc返回编辑器")
+        equal(app.runEnvironment, nil, label .. "Esc释放运行环境")
+        equal(app.userTimerActive, false, label .. "Esc停止用户timer")
+        equal(app.input.focused, true, label .. "Esc恢复输入焦点")
+        equal(timer.running, true, label .. "Esc恢复输入轮询")
+        equal(timer.interval, 0.04, label .. "Esc恢复轮询间隔")
+
+        app.buffer:setText("function on.paint(")
+        equal(app:startRun(), false, label .. "报告语法错误")
+        contains(app.status, "语法错误", label .. "语法错误状态")
+        equal(app.running, false, label .. "语法错误留在编辑器")
+        app.buffer:setText("error('native top failure')")
+        equal(app:startRun(), false, label .. "捕获顶层错误")
+        contains(table.concat(app.consoleLines, "\n"), "native top failure",
+            label .. "顶层错误输出")
+        equal(app.runEnvironment, nil, label .. "顶层错误清理")
+        equal(timer.interval, 0.04, label .. "顶层错误恢复轮询")
+        app.buffer:setText("function on.timer() error('native timer failure') end")
+        equal(app:startRun(), true, label .. "错误后重新启动")
+        on.timer()
+        equal(app.running, false, label .. "事件错误退出预览")
+        local errorOutput = table.concat(app.consoleLines, "\n")
+        contains(errorOutput, "native timer failure", label .. "事件错误输出")
+        contains(errorOutput, "nMoon/native_preview:1:", label .. "原生错误位置")
+        if debugApi and debugApi.traceback then
+            contains(errorOutput, "stack traceback", label .. "可用的traceback")
+        end
+        equal(app.consoleVisible, true, label .. "事件错误显示控制台")
+        equal(app.input.focused, true, label .. "事件错误恢复焦点")
+        equal(timer.interval, 0.04, label .. "事件错误恢复轮询")
+        app.buffer:setText("print('recovered native')")
+        equal(app:startRun(), true, label .. "事件错误后仍可运行")
+        equal(app.consoleLines[1], "recovered native", label .. "恢复后的输出")
+        on.escapeKey()
+        debug = hostDebug
+    end
+    assertNativePreview(nil, "debug=nil：")
+    assertNativePreview({ traceback = hostDebug.traceback }, "无sethook：")
+    assertNativePreview({
+        traceback = hostDebug.traceback,
+        sethook = function() error("host refuses hooks") end
+    }, "sethook安装失败：")
+end
 
 
 print("nMoon app tests: OK")

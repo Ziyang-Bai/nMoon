@@ -48,14 +48,15 @@ local function consumeFault(operation, ...)
 end
 if not loadstring then loadstring = load end
 if not setfenv then
+    local runtimeDebug = debug
     function setfenv(fn, environment)
         local index = 1
         while true do
-            local name = debug.getupvalue(fn, index)
+            local name = runtimeDebug.getupvalue(fn, index)
             if not name then break end
             if name == "_ENV" then
                 local function holder() return environment end
-                debug.upvaluejoin(fn, index, holder, 1)
+                runtimeDebug.upvaluejoin(fn, index, holder, 1)
                 break
             end
             index = index + 1
