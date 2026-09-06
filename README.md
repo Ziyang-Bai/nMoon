@@ -12,7 +12,7 @@ nMoon Alpha 是运行在 TI-Nspire 上的中文 Lua 编辑器。它可以编辑�
 
 ## 开始使用
 
-仓库保存源码和构建配置；`build.py` 把成品写入 `dist/`。完成下方构建后，将 `dist/nMoon.tns` 传到 TI-Nspire 并打开。nMoon 使用 TI-Nspire Lua API 2.7。
+从下方 GitHub Actions 下载 `nMoon.tns`，或按源码构建步骤生成 `dist/nMoon.tns`，再传到 TI-Nspire 并打开。nMoon 使用 TI-Nspire Lua API 2.7。
 
 应用内的“帮助”菜单列出了按键和组合键。常用组合键：
 
@@ -26,6 +26,12 @@ nMoon Alpha 是运行在 TI-Nspire 上的中文 Lua 编辑器。它可以编辑�
 在 TI-Nspire 上按 `Ctrl+R` 即可运行当前代码，`print` 输出显示在控制台，`on.paint(gc)` 绘制的内容显示在图形预览中。运行时按 `Tab` 切换两种视图，按 `Esc` 返回编辑器。
 
 运行时可以捕获并显示错误；指令预算仅在提供 `debug.sethook` 的环境中启用，普通 TI Lua 中的循环需自行结束，`Esc` 在回调之间响应。
+
+## 自动构建与下载
+
+每次推送和 Pull Request 都会自动测试并构建，也可以在 [GitHub Actions](https://github.com/Ziyang-Bai/nMoon/actions/workflows/build.yml) 中点击 **Run workflow** 手动构建。
+
+登录 GitHub，打开一次绿色通过的运行，在页面底部的 **Artifacts** 下载 `nMoon` ZIP，解压得到 `nMoon.tns`，传到 TI-Nspire 即可使用。
 
 ## 从源码构建
 
